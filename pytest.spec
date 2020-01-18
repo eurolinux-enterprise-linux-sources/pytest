@@ -9,7 +9,7 @@
 
 Name:           pytest
 Version:        2.7.0
-Release:        1%{?dist}
+Release:        2%{?dist}
 Summary:        Simple powerful testing with Python
 
 Group:          Development/Languages
@@ -38,6 +38,12 @@ BuildRequires:  python3-py >= %{pylib_version}
 %endif # with_python3
 # pytest was separated from pylib at that point
 Conflicts:      python-py < 1.4.0
+
+
+# Provide the python and python2 namespace
+# for the pytest binary rpm.
+Provides: python2-pytest = %{version}-%{release}
+%{?python_provide:%python_provide python2-%{name}}
 
 # used by the testsuite, if present:
 %if 0%{?fedora}
@@ -168,6 +174,10 @@ popd
 
 
 %changelog
+* Wed May 09 2018 Charalampos Stratakis <cstratak@redhat.com> - 2.7.0-2
+- Provide the python and python2 namespace for the pytest binary rpm
+Resolves: rhbz#1520711
+
 * Wed May 06 2015 Matej Stuchlik <mstuchli@redhat.com> - 2.7.0-1
 - Update to 2.7.0
 Resolves: rhbz#1206254
