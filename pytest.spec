@@ -9,7 +9,7 @@
 
 Name:           pytest
 Version:        2.3.5
-Release:        3%{?dist}
+Release:        4%{?dist}
 Summary:        Simple powerful testing with Python
 
 Group:          Development/Languages
@@ -166,6 +166,9 @@ popd
 
 
 %changelog
+* Fri Dec 27 2013 Daniel Mach <dmach@redhat.com> - 2.3.5-4
+- Mass rebuild 2013-12-27
+
 * Thu Jun 13 2013 Thomas Moschny <thomas.moschny@gmx.de> - 2.3.5-3
 - Disable tests using pexpect for now, fails on F19.
 
