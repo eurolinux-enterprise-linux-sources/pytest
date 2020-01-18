@@ -11,8 +11,8 @@ def pytest_addhooks(pluginmanager):
 
 def pytest_namespace():
     """return dict of name->object to be made globally available in
-    the py.test/pytest namespace.  This hook is called before command
-    line options are parsed.
+    the pytest namespace.  This hook is called before command line options
+    are parsed.
     """
 
 def pytest_cmdline_parse(pluginmanager, args):
@@ -20,10 +20,10 @@ def pytest_cmdline_parse(pluginmanager, args):
 pytest_cmdline_parse.firstresult = True
 
 def pytest_cmdline_preparse(config, args):
-    """modify command line arguments before option parsing. """
+    """(deprecated) modify command line arguments before option parsing. """
 
 def pytest_addoption(parser):
-    """register optparse-style options and ini-style config values.
+    """register argparse-style options and ini-style config values.
 
     This function must be implemented in a :ref:`plugin <pluginorder>` and is
     called once at the beginning of a test run.
@@ -51,6 +51,10 @@ def pytest_cmdline_main(config):
     """ called for performing the main command line action. The default
     implementation will invoke the configure hooks and runtest_mainloop. """
 pytest_cmdline_main.firstresult = True
+
+def pytest_load_initial_conftests(args, early_config, parser):
+    """ implements the loading of initial conftest files ahead
+    of command line option parsing. """
 
 def pytest_configure(config):
     """ called after command line options have been parsed
@@ -138,7 +142,7 @@ def pytest_generate_tests(metafunc):
 # -------------------------------------------------------------------------
 # generic runtest related hooks
 # -------------------------------------------------------------------------
-def pytest_itemstart(item, node=None):
+def pytest_itemstart(item, node):
     """ (deprecated, use pytest_runtest_logstart). """
 
 def pytest_runtest_protocol(item, nextitem):
@@ -148,9 +152,9 @@ def pytest_runtest_protocol(item, nextitem):
 
     :arg item: test item for which the runtest protocol is performed.
 
-    :arg nexitem: the scheduled-to-be-next test item (or None if this
-                  is the end my friend).  This argument is passed on to
-                  :py:func:`pytest_runtest_teardown`.
+    :arg nextitem: the scheduled-to-be-next test item (or None if this
+                   is the end my friend).  This argument is passed on to
+                   :py:func:`pytest_runtest_teardown`.
 
     :return boolean: True if no further hook implementations should be invoked.
     """
@@ -168,10 +172,10 @@ def pytest_runtest_call(item):
 def pytest_runtest_teardown(item, nextitem):
     """ called after ``pytest_runtest_call``.
 
-    :arg nexitem: the scheduled-to-be-next test item (None if no further
-                  test item is scheduled).  This argument can be used to
-                  perform exact teardowns, i.e. calling just enough finalizers
-                  so that nextitem only needs to call setup-functions.
+    :arg nextitem: the scheduled-to-be-next test item (None if no further
+                   test item is scheduled).  This argument can be used to
+                   perform exact teardowns, i.e. calling just enough finalizers
+                   so that nextitem only needs to call setup-functions.
     """
 
 def pytest_runtest_makereport(item, call):
@@ -221,7 +225,12 @@ def pytest_report_teststatus(report):
 pytest_report_teststatus.firstresult = True
 
 def pytest_terminal_summary(terminalreporter):
-    """ add additional section in terminal summary reporting. """
+    """ add additional section in terminal summary reporting.  """
+
+def pytest_logwarning(message, code, nodeid, fslocation):
+    """ process a warning specified by a message, a code string,
+    a nodeid and fslocation (both of which may be None
+    if the warning is not tied to a partilar node/location)."""
 
 # -------------------------------------------------------------------------
 # doctest hooks
@@ -236,13 +245,22 @@ pytest_doctest_prepare_content.firstresult = True
 # -------------------------------------------------------------------------
 
 def pytest_plugin_registered(plugin, manager):
-    """ a new py lib plugin got registered. """
+    """ a new pytest plugin got registered. """
 
-def pytest_plugin_unregistered(plugin):
-    """ a py lib plugin got unregistered. """
-
-def pytest_internalerror(excrepr):
+def pytest_internalerror(excrepr, excinfo):
     """ called for internal errors. """
 
 def pytest_keyboard_interrupt(excinfo):
     """ called for keyboard interrupt. """
+
+def pytest_exception_interact(node, call, report):
+    """ (experimental, new in 2.4) called when
+    an exception was raised which can potentially be
+    interactively handled.
+
+    This hook is only called if an exception was raised
+    that is not an internal exception like "skip.Exception".
+    """
+
+def pytest_enter_pdb():
+    """ called upon pdb.set_trace()"""

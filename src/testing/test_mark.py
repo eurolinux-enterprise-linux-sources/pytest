@@ -13,7 +13,11 @@ class TestMark:
 
     def test_pytest_mark_notcallable(self):
         mark = Mark()
-        pytest.raises((AttributeError, TypeError), "mark()")
+        pytest.raises((AttributeError, TypeError), mark)
+
+    def test_pytest_mark_name_starts_with_underscore(self):
+        mark = Mark()
+        pytest.raises(AttributeError, getattr, mark, '_some_name')
 
     def test_pytest_mark_bare(self):
         mark = Mark()
@@ -35,7 +39,7 @@ class TestMark:
         mark = Mark()
         def f():
             pass
-        marker = mark.world
+        mark.world
         mark.world(x=3)(f)
         assert f.world.kwargs['x'] == 3
         mark.world(y=4)(f)
@@ -52,6 +56,17 @@ class TestMark:
         mark.world("hello")(f)
         assert f.world.args[0] == "hello"
         mark.world("world")(f)
+
+    def test_pytest_mark_positional_func_and_keyword(self):
+        mark = Mark()
+        def f():
+            raise Exception
+        m = mark.world(f, omega="hello")
+        def g():
+            pass
+        assert m(g) == g
+        assert g.world.args[0] is f
+        assert g.world.kwargs["omega"] == "hello"
 
     def test_pytest_mark_reuse(self):
         mark = Mark()
@@ -100,6 +115,38 @@ def test_markers_option(testdir):
         "*a1some*another marker",
     ])
 
+def test_markers_option_with_plugin_in_current_dir(testdir):
+    testdir.makeconftest('pytest_plugins = "flip_flop"')
+    testdir.makepyfile(flip_flop="""\
+        def pytest_configure(config):
+            config.addinivalue_line("markers", "flip:flop")
+
+        def pytest_generate_tests(metafunc):
+            try:
+                mark = metafunc.function.flipper
+            except AttributeError:
+                return
+            metafunc.parametrize("x", (10, 20))""")
+    testdir.makepyfile("""\
+        import pytest
+        @pytest.mark.flipper
+        def test_example(x):
+            assert x""")
+
+    result = testdir.runpytest("--markers")
+    result.stdout.fnmatch_lines(["*flip*flop*"])
+
+
+def test_mark_on_pseudo_function(testdir):
+    testdir.makepyfile("""
+        import pytest
+
+        @pytest.mark.r(lambda x: 0/0)
+        def test_hello():
+            pass
+    """)
+    reprec = testdir.inline_run()
+    reprec.assertoutcome(passed=1)
 
 def test_strict_prohibits_unregistered_markers(testdir):
     testdir.makepyfile("""
@@ -114,7 +161,7 @@ def test_strict_prohibits_unregistered_markers(testdir):
         "*unregisteredmark*not*registered*",
     ])
 
-@pytest.mark.multi(spec=[
+@pytest.mark.parametrize("spec", [
         ("xyz", ("test_one",)),
         ("xyz and xyz2", ()),
         ("xyz2", ("test_two",)),
@@ -137,7 +184,7 @@ def test_mark_option(spec, testdir):
     assert len(passed) == len(passed_result)
     assert list(passed) == list(passed_result)
 
-@pytest.mark.multi(spec=[
+@pytest.mark.parametrize("spec", [
         ("interface", ("test_interface",)),
         ("not interface", ("test_nointer",)),
 ])
@@ -162,15 +209,39 @@ def test_mark_option_custom(spec, testdir):
     assert len(passed) == len(passed_result)
     assert list(passed) == list(passed_result)
 
-@pytest.mark.multi(spec=[
+@pytest.mark.parametrize("spec", [
         ("interface", ("test_interface",)),
-        ("not interface", ("test_nointer",)),
+        ("not interface", ("test_nointer", "test_pass")),
+        ("pass", ("test_pass",)),
+        ("not pass", ("test_interface", "test_nointer")),
 ])
 def test_keyword_option_custom(spec, testdir):
     testdir.makepyfile("""
         def test_interface():
             pass
         def test_nointer():
+            pass
+        def test_pass():
+            pass
+    """)
+    opt, passed_result = spec
+    rec = testdir.inline_run("-k", opt)
+    passed, skipped, fail = rec.listoutcomes()
+    passed = [x.nodeid.split("::")[-1] for x in passed]
+    assert len(passed) == len(passed_result)
+    assert list(passed) == list(passed_result)
+
+
+@pytest.mark.parametrize("spec", [
+        ("None", ("test_func[None]",)),
+        ("1.3", ("test_func[1.3]",)),
+        ("2-3", ("test_func[2-3]",))
+])
+def test_keyword_option_parametrize(spec, testdir):
+    testdir.makepyfile("""
+        import pytest
+        @pytest.mark.parametrize("arg", [None, 1.3, "2-3"])
+        def test_func(arg):
             pass
     """)
     opt, passed_result = spec
@@ -317,7 +388,7 @@ class TestFunctional:
                 request.applymarker(pytest.mark.hello)
             def pytest_terminal_summary(terminalreporter):
                 l = terminalreporter.stats['passed']
-                terminalreporter._tw.line("keyword: %s" % l[0].keywords)
+                terminalreporter.writer.line("keyword: %s" % l[0].keywords)
         """)
         testdir.makepyfile("""
             def test_func(arg):
@@ -345,8 +416,25 @@ class TestFunctional:
         assert l[0].args == ("pos0",)
         assert l[1].args == ("pos1",)
 
-    def test_keywords_at_node_level(self, testdir):
+    def test_no_marker_match_on_unmarked_names(self, testdir):
         p = testdir.makepyfile("""
+            import pytest
+            @pytest.mark.shouldmatch
+            def test_marked():
+                assert 1
+
+            def test_unmarked():
+                assert 1
+        """)
+        reprec = testdir.inline_run("-m", "test_unmarked", p)
+        passed, skipped, failed = reprec.listoutcomes()
+        assert len(passed) + len(skipped) + len(failed) == 0
+        dlist = reprec.getcalls("pytest_deselected")
+        deselected_tests = dlist[0].items
+        assert len(deselected_tests) == 2
+
+    def test_keywords_at_node_level(self, testdir):
+        testdir.makepyfile("""
             import pytest
             @pytest.fixture(scope="session", autouse=True)
             def some(request):
@@ -363,6 +451,30 @@ class TestFunctional:
                 pass
         """)
         reprec = testdir.inline_run()
+        reprec.assertoutcome(passed=1)
+
+    def test_keyword_added_for_session(self, testdir):
+        testdir.makeconftest("""
+            import pytest
+            def pytest_collection_modifyitems(session):
+                session.add_marker("mark1")
+                session.add_marker(pytest.mark.mark2)
+                session.add_marker(pytest.mark.mark3)
+                pytest.raises(ValueError, lambda:
+                        session.add_marker(10))
+        """)
+        testdir.makepyfile("""
+            def test_some(request):
+                assert "mark1" in request.keywords
+                assert "mark2" in request.keywords
+                assert "mark3" in request.keywords
+                assert 10 not in request.keywords
+                marker = request.node.get_marker("mark1")
+                assert marker.name == "mark1"
+                assert marker.args == ()
+                assert marker.kwargs == {}
+        """)
+        reprec = testdir.inline_run("-m", "mark1")
         reprec.assertoutcome(passed=1)
 
 class TestKeywordSelection:
@@ -382,12 +494,11 @@ class TestKeywordSelection:
             assert len(reprec.getcalls('pytest_deselected')) == 1
 
         for keyword in ['test_one', 'est_on']:
-            #yield check, keyword, 'test_one'
             check(keyword, 'test_one')
         check('TestClass and test', 'test_method_one')
 
     @pytest.mark.parametrize("keyword", [
-        'xxx', 'xxx and test_2', 'TestClass', 'xxx and -test_1',
+        'xxx', 'xxx and test_2', 'TestClass', 'xxx and not test_1',
         'TestClass and test_2', 'xxx and TestClass and test_2'])
     def test_select_extra_keywords(self, testdir, keyword):
         p = testdir.makepyfile(test_select="""
@@ -398,11 +509,13 @@ class TestKeywordSelection:
                     pass
         """)
         testdir.makepyfile(conftest="""
-            def pytest_pycollect_makeitem(__multicall__, name):
+            import pytest
+            @pytest.mark.hookwrapper
+            def pytest_pycollect_makeitem(name):
+                outcome = yield
                 if name == "TestClass":
-                    item = __multicall__.execute()
-                    item.keywords["xxx"] = True
-                    return item
+                    item = outcome.get_result()
+                    item.extra_keyword_matches.add("xxx")
         """)
         reprec = testdir.inline_run(p.dirpath(), '-s', '-k', keyword)
         py.builtin.print_("keyword", repr(keyword))
@@ -434,9 +547,39 @@ class TestKeywordSelection:
                assert 0
            test_one.mykeyword = True
         """)
-        reprec = testdir.inline_run("-k", "-mykeyword", p)
-        passed, skipped, failed = reprec.countoutcomes()
-        assert passed + skipped + failed == 0
         reprec = testdir.inline_run("-k", "mykeyword", p)
         passed, skipped, failed = reprec.countoutcomes()
         assert failed == 1
+
+    @pytest.mark.xfail
+    def test_keyword_extra_dash(self, testdir):
+        p = testdir.makepyfile("""
+           def test_one():
+               assert 0
+           test_one.mykeyword = True
+        """)
+        # with argparse the argument to an option cannot
+        # start with '-'
+        reprec = testdir.inline_run("-k", "-mykeyword", p)
+        passed, skipped, failed = reprec.countoutcomes()
+        assert passed + skipped + failed == 0
+
+    def test_no_magic_values(self, testdir):
+        """Make sure the tests do not match on magic values,
+        no double underscored values, like '__dict__',
+        and no instance values, like '()'.
+        """
+        p = testdir.makepyfile("""
+            def test_one(): assert 1
+        """)
+        def assert_test_is_not_selected(keyword):
+            reprec = testdir.inline_run("-k", keyword, p)
+            passed, skipped, failed = reprec.countoutcomes()
+            dlist = reprec.getcalls("pytest_deselected")
+            assert passed + skipped + failed == 0
+            deselected_tests = dlist[0].items
+            assert len(deselected_tests) == 1
+
+        assert_test_is_not_selected("__")
+        assert_test_is_not_selected("()")
+

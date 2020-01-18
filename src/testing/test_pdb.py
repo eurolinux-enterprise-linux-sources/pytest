@@ -1,5 +1,7 @@
-import py, pytest
+
+import py
 import sys
+
 
 class TestPDB:
     def pytest_funcarg__pdblist(self, request):
@@ -60,7 +62,7 @@ class TestPDB:
         child.expect(".*i = 0")
         child.expect("(Pdb)")
         child.sendeof()
-        rest = child.read()
+        rest = child.read().decode("utf8")
         assert "1 failed" in rest
         assert "def test_1" not in rest
         if child.isalive():
@@ -85,6 +87,32 @@ class TestPDB:
         if child.isalive():
             child.wait()
 
+    def test_pdb_interaction_on_collection_issue181(self, testdir):
+        p1 = testdir.makepyfile("""
+            import pytest
+            xxx
+        """)
+        child = testdir.spawn_pytest("--pdb %s" % p1)
+        #child.expect(".*import pytest.*")
+        child.expect("(Pdb)")
+        child.sendeof()
+        child.expect("1 error")
+        if child.isalive():
+            child.wait()
+
+    def test_pdb_interaction_on_internal_error(self, testdir):
+        testdir.makeconftest("""
+            def pytest_runtest_protocol():
+                0/0
+        """)
+        p1 = testdir.makepyfile("def test_func(): pass")
+        child = testdir.spawn_pytest("--pdb %s" % p1)
+        #child.expect(".*import pytest.*")
+        child.expect("(Pdb)")
+        child.sendeof()
+        if child.isalive():
+            child.wait()
+
     def test_pdb_interaction_capturing_simple(self, testdir):
         p1 = testdir.makepyfile("""
             import pytest
@@ -99,10 +127,26 @@ class TestPDB:
         child.expect("x = 3")
         child.expect("(Pdb)")
         child.sendeof()
-        rest = child.read()
+        rest = child.read().decode("utf-8")
         assert "1 failed" in rest
         assert "def test_1" in rest
         assert "hello17" in rest # out is captured
+        if child.isalive():
+            child.wait()
+
+    def test_pdb_set_trace_interception(self, testdir):
+        p1 = testdir.makepyfile("""
+            import pdb
+            def test_1():
+                pdb.set_trace()
+        """)
+        child = testdir.spawn_pytest(str(p1))
+        child.expect("test_1")
+        child.expect("(Pdb)")
+        child.sendeof()
+        rest = child.read().decode("utf8")
+        assert "1 failed" in rest
+        assert "reading from stdin while output" not in rest
         if child.isalive():
             child.wait()
 
@@ -118,7 +162,27 @@ class TestPDB:
         child.send("capsys.readouterr()\n")
         child.expect("hello1")
         child.sendeof()
-        rest = child.read()
+        child.read()
+        if child.isalive():
+            child.wait()
+
+    def test_set_trace_capturing_afterwards(self, testdir):
+        p1 = testdir.makepyfile("""
+            import pdb
+            def test_1():
+                pdb.set_trace()
+            def test_2():
+                print ("hello")
+                assert 0
+        """)
+        child = testdir.spawn_pytest(str(p1))
+        child.expect("test_1")
+        child.send("c\n")
+        child.expect("test_2")
+        child.expect("Captured")
+        child.expect("hello")
+        child.sendeof()
+        child.read()
         if child.isalive():
             child.wait()
 
@@ -137,7 +201,7 @@ class TestPDB:
         child.expect("0")
         child.expect("(Pdb)")
         child.sendeof()
-        rest = child.read()
+        rest = child.read().decode("utf8")
         assert "1 failed" in rest
         if child.isalive():
             child.wait()
@@ -161,7 +225,7 @@ class TestPDB:
         child.sendline('c')
         child.expect("x = 4")
         child.sendeof()
-        rest = child.read()
+        rest = child.read().decode("utf8")
         assert "1 failed" in rest
         assert "def test_1" in rest
         assert "hello17" in rest # out is captured
@@ -193,6 +257,7 @@ class TestPDB:
         child.expect("x = 5")
         child.sendeof()
         child.wait()
+
     def test_pdb_collection_failure_is_shown(self, testdir):
         p1 = testdir.makepyfile("""xxx """)
         result = testdir.runpytest("--pdb", p1)
@@ -200,3 +265,21 @@ class TestPDB:
             "*NameError*xxx*",
             "*1 error*",
         ])
+
+    def test_enter_pdb_hook_is_called(self, testdir):
+        testdir.makeconftest("""
+            def pytest_enter_pdb():
+                print 'enter_pdb_hook'
+        """)
+        p1 = testdir.makepyfile("""
+            import pytest
+
+            def test_foo():
+                pytest.set_trace()
+        """)
+        child = testdir.spawn_pytest(str(p1))
+        child.expect("enter_pdb_hook")
+        child.send('c\n')
+        child.sendeof()
+        if child.isalive():
+            child.wait()

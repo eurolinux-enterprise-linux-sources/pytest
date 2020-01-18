@@ -1,10 +1,13 @@
 """ discover and run doctests in modules and test files."""
-
+from __future__ import absolute_import
+import traceback
 import pytest, py
 from _pytest.python import FixtureRequest, FuncFixtureInfo
 from py._code.code import TerminalRepr, ReprFileLocation
 
 def pytest_addoption(parser):
+    parser.addini('doctest_optionflags', 'option flags for doctests',
+        type="args", default=["ELLIPSIS"])
     group = parser.getgroup("collect")
     group.addoption("--doctest-modules",
         action="store_true", default=False,
@@ -14,6 +17,10 @@ def pytest_addoption(parser):
         action="store", default="test*.txt", metavar="pat",
         help="doctests file matching pattern, default: test*.txt",
         dest="doctestglob")
+    group.addoption("--doctest-ignore-import-errors",
+        action="store_true", default=False,
+        help="ignore doctest ImportErrors",
+        dest="doctest_ignore_import_errors")
 
 def pytest_collect_file(path, parent):
     config = parent.config
@@ -34,8 +41,16 @@ class ReprFailDoctest(TerminalRepr):
         self.reprlocation.toterminal(tw)
 
 class DoctestItem(pytest.Item):
+    def __init__(self, name, parent, runner=None, dtest=None):
+        super(DoctestItem, self).__init__(name, parent)
+        self.runner = runner
+        self.dtest = dtest
+
+    def runtest(self):
+        self.runner.run(self.dtest)
+
     def repr_failure(self, excinfo):
-        doctest = py.std.doctest
+        import doctest
         if excinfo.errisinstance((doctest.DocTestFailure,
                                   doctest.UnexpectedException)):
             doctestfailure = excinfo.value
@@ -48,8 +63,8 @@ class DoctestItem(pytest.Item):
                 lineno = test.lineno + example.lineno + 1
             message = excinfo.type.__name__
             reprlocation = ReprFileLocation(filename, lineno, message)
-            checker = py.std.doctest.OutputChecker()
-            REPORT_UDIFF = py.std.doctest.REPORT_UDIFF
+            checker = doctest.OutputChecker()
+            REPORT_UDIFF = doctest.REPORT_UDIFF
             filelines = py.path.local(filename).readlines(cr=0)
             lines = []
             if lineno is not None:
@@ -70,39 +85,72 @@ class DoctestItem(pytest.Item):
                 inner_excinfo = py.code.ExceptionInfo(excinfo.value.exc_info)
                 lines += ["UNEXPECTED EXCEPTION: %s" %
                             repr(inner_excinfo.value)]
-                lines += py.std.traceback.format_exception(*excinfo.value.exc_info)
+                lines += traceback.format_exception(*excinfo.value.exc_info)
             return ReprFailDoctest(reprlocation, lines)
         else:
             return super(DoctestItem, self).repr_failure(excinfo)
 
     def reportinfo(self):
-        return self.fspath, None, "[doctest]"
+        return self.fspath, None, "[doctest] %s" % self.name
+
+def _get_flag_lookup():
+    import doctest
+    return dict(DONT_ACCEPT_TRUE_FOR_1=doctest.DONT_ACCEPT_TRUE_FOR_1,
+                DONT_ACCEPT_BLANKLINE=doctest.DONT_ACCEPT_BLANKLINE,
+                NORMALIZE_WHITESPACE=doctest.NORMALIZE_WHITESPACE,
+                ELLIPSIS=doctest.ELLIPSIS,
+                IGNORE_EXCEPTION_DETAIL=doctest.IGNORE_EXCEPTION_DETAIL,
+                COMPARISON_FLAGS=doctest.COMPARISON_FLAGS)
+
+def get_optionflags(parent):
+    optionflags_str = parent.config.getini("doctest_optionflags")
+    flag_lookup_table = _get_flag_lookup()
+    flag_acc = 0
+    for flag in optionflags_str:
+        flag_acc |= flag_lookup_table[flag]
+    return flag_acc
 
 class DoctestTextfile(DoctestItem, pytest.File):
     def runtest(self):
-        doctest = py.std.doctest
+        import doctest
         # satisfy `FixtureRequest` constructor...
         self.funcargs = {}
-        self._fixtureinfo = FuncFixtureInfo((), [], {})
+        fm = self.session._fixturemanager
+        def func():
+            pass
+        self._fixtureinfo = fm.getfixtureinfo(node=self, func=func,
+                                              cls=None, funcargs=False)
         fixture_request = FixtureRequest(self)
+        fixture_request._fillfixtures()
         failed, tot = doctest.testfile(
             str(self.fspath), module_relative=False,
-            optionflags=doctest.ELLIPSIS,
+            optionflags=get_optionflags(self),
             extraglobs=dict(getfixture=fixture_request.getfuncargvalue),
             raise_on_error=True, verbose=0)
 
-class DoctestModule(DoctestItem, pytest.File):
-    def runtest(self):
-        doctest = py.std.doctest
+class DoctestModule(pytest.File):
+    def collect(self):
+        import doctest
         if self.fspath.basename == "conftest.py":
             module = self.config._conftest.importconftest(self.fspath)
         else:
-            module = self.fspath.pyimport()
+            try:
+                module = self.fspath.pyimport()
+            except ImportError:
+                if self.config.getvalue('doctest_ignore_import_errors'):
+                    pytest.skip('unable to import module %r' % self.fspath)
+                else:
+                    raise
         # satisfy `FixtureRequest` constructor...
         self.funcargs = {}
         self._fixtureinfo = FuncFixtureInfo((), [], {})
         fixture_request = FixtureRequest(self)
-        failed, tot = doctest.testmod(
-            module, raise_on_error=True, verbose=0,
-            extraglobs=dict(getfixture=fixture_request.getfuncargvalue),
-            optionflags=doctest.ELLIPSIS)
+        doctest_globals = dict(getfixture=fixture_request.getfuncargvalue)
+        # uses internal doctest module parsing mechanism
+        finder = doctest.DocTestFinder()
+        optionflags = get_optionflags(self)
+        runner = doctest.DebugRunner(verbose=0, optionflags=optionflags)
+        for test in finder.find(module, module.__name__,
+                                extraglobs=doctest_globals):
+            if test.examples:  # skip empty doctests
+                yield DoctestItem(test.name, self, runner, test)

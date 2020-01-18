@@ -1,10 +1,14 @@
+# -*- coding: utf-8 -*-
 import sys
+import textwrap
 
 import py, pytest
 import _pytest.assertion as plugin
-from _pytest.assertion import reinterpret, util
+from _pytest.assertion import reinterpret
+from _pytest.assertion import util
 
 needsnewassert = pytest.mark.skipif("sys.version_info < (2,6)")
+PY3 = sys.version_info >= (3, 0)
 
 
 @pytest.fixture
@@ -85,6 +89,48 @@ class TestAssert_reprcompare:
         expl = callequal([0, 1], [0, 2])
         assert len(expl) > 1
 
+    @pytest.mark.parametrize(
+        ['left', 'right', 'expected'], [
+            ([0, 1], [0, 2], """
+                Full diff:
+                - [0, 1]
+                ?     ^
+                + [0, 2]
+                ?     ^
+            """),
+            ({0: 1}, {0: 2}, """
+                Full diff:
+                - {0: 1}
+                ?     ^
+                + {0: 2}
+                ?     ^
+            """),
+            (set([0, 1]), set([0, 2]), """
+                Full diff:
+                - set([0, 1])
+                ?         ^
+                + set([0, 2])
+                ?         ^
+            """ if not PY3 else """
+                Full diff:
+                - {0, 1}
+                ?     ^
+                + {0, 2}
+                ?     ^
+            """)
+        ]
+    )
+    def test_iterable_full_diff(self, left, right, expected):
+        """Test the full diff assertion failure explanation.
+
+        When verbose is False, then just a -v notice to get the diff is rendered,
+        when verbose is True, then ndiff of the pprint is returned.
+        """
+        expl = callequal(left, right, verbose=False)
+        assert expl[-1] == 'Use -v to get the full diff'
+        expl = '\n'.join(callequal(left, right, verbose=True))
+        assert expl.endswith(textwrap.dedent(expected).strip())
+
     def test_list_different_lenghts(self):
         expl = callequal([0, 1], [0, 1, 2])
         assert len(expl) > 1
@@ -95,13 +141,56 @@ class TestAssert_reprcompare:
         expl = callequal({'a': 0}, {'a': 1})
         assert len(expl) > 1
 
+    def test_dict_omitting(self):
+        lines = callequal({'a': 0, 'b': 1}, {'a': 1, 'b': 1})
+        assert lines[1].startswith('Omitting 1 identical item')
+        assert 'Common items' not in lines
+        for line in lines[1:]:
+            assert 'b' not in line
+
+    def test_dict_omitting_verbose(self):
+        lines = callequal({'a': 0, 'b': 1}, {'a': 1, 'b': 1}, verbose=True)
+        assert lines[1].startswith('Common items:')
+        assert 'Omitting' not in lines[1]
+        assert lines[2] == "{'b': 1}"
+
     def test_set(self):
         expl = callequal(set([0, 1]), set([0, 2]))
         assert len(expl) > 1
 
     def test_frozenzet(self):
         expl = callequal(frozenset([0, 1]), set([0, 2]))
-        print (expl)
+        assert len(expl) > 1
+
+    def test_Sequence(self):
+        col = py.builtin._tryimport(
+            "collections.abc",
+            "collections",
+            "sys")
+        if not hasattr(col, "MutableSequence"):
+            pytest.skip("cannot import MutableSequence")
+        MutableSequence = col.MutableSequence
+
+        class TestSequence(MutableSequence):  # works with a Sequence subclass
+            def __init__(self, iterable):
+                self.elements = list(iterable)
+
+            def __getitem__(self, item):
+                return self.elements[item]
+
+            def __len__(self):
+                return len(self.elements)
+
+            def __setitem__(self, item, value):
+                pass
+
+            def __delitem__(self, item):
+                pass
+
+            def insert(self, item, index):
+                pass
+
+        expl = callequal(TestSequence([0, 1]), list([0, 2]))
         assert len(expl) > 1
 
     def test_list_tuples(self):
@@ -133,6 +222,120 @@ class TestAssert_reprcompare:
     def test_repr_no_exc(self):
         expl = ' '.join(callequal('foo', 'bar'))
         assert 'raised in repr()' not in expl
+
+    def test_unicode(self):
+        left = py.builtin._totext('£€', 'utf-8')
+        right = py.builtin._totext('£', 'utf-8')
+        expl = callequal(left, right)
+        assert expl[0] == py.builtin._totext("'£€' == '£'", 'utf-8')
+        assert expl[1] == py.builtin._totext('- £€', 'utf-8')
+        assert expl[2] == py.builtin._totext('+ £', 'utf-8')
+
+    def test_mojibake(self):
+        # issue 429
+        left = 'e'
+        right = '\xc3\xa9'
+        if not isinstance(left, py.builtin.bytes):
+            left = py.builtin.bytes(left, 'utf-8')
+            right = py.builtin.bytes(right, 'utf-8')
+        expl = callequal(left, right)
+        for line in expl:
+            assert isinstance(line, py.builtin.text)
+        msg = py.builtin._totext('\n').join(expl)
+        assert msg
+
+
+class TestFormatExplanation:
+
+    def test_special_chars_full(self, testdir):
+        # Issue 453, for the bug this would raise IndexError
+        testdir.makepyfile("""
+            def test_foo():
+                assert '\\n}' == ''
+        """)
+        result = testdir.runpytest()
+        assert result.ret == 1
+        result.stdout.fnmatch_lines([
+            "*AssertionError*",
+        ])
+
+    def test_fmt_simple(self):
+        expl = 'assert foo'
+        assert util.format_explanation(expl) == 'assert foo'
+
+    def test_fmt_where(self):
+        expl = '\n'.join(['assert 1',
+                          '{1 = foo',
+                          '} == 2'])
+        res = '\n'.join(['assert 1 == 2',
+                         ' +  where 1 = foo'])
+        assert util.format_explanation(expl) == res
+
+    def test_fmt_and(self):
+        expl = '\n'.join(['assert 1',
+                          '{1 = foo',
+                          '} == 2',
+                          '{2 = bar',
+                          '}'])
+        res = '\n'.join(['assert 1 == 2',
+                         ' +  where 1 = foo',
+                         ' +  and   2 = bar'])
+        assert util.format_explanation(expl) == res
+
+    def test_fmt_where_nested(self):
+        expl = '\n'.join(['assert 1',
+                          '{1 = foo',
+                          '{foo = bar',
+                          '}',
+                          '} == 2'])
+        res = '\n'.join(['assert 1 == 2',
+                         ' +  where 1 = foo',
+                         ' +    where foo = bar'])
+        assert util.format_explanation(expl) == res
+
+    def test_fmt_newline(self):
+        expl = '\n'.join(['assert "foo" == "bar"',
+                          '~- foo',
+                          '~+ bar'])
+        res = '\n'.join(['assert "foo" == "bar"',
+                         '  - foo',
+                         '  + bar'])
+        assert util.format_explanation(expl) == res
+
+    def test_fmt_newline_escaped(self):
+        expl = '\n'.join(['assert foo == bar',
+                          'baz'])
+        res = 'assert foo == bar\\nbaz'
+        assert util.format_explanation(expl) == res
+
+    def test_fmt_newline_before_where(self):
+        expl = '\n'.join(['the assertion message here',
+                          '>assert 1',
+                          '{1 = foo',
+                          '} == 2',
+                          '{2 = bar',
+                          '}'])
+        res = '\n'.join(['the assertion message here',
+                         'assert 1 == 2',
+                         ' +  where 1 = foo',
+                         ' +  and   2 = bar'])
+        assert util.format_explanation(expl) == res
+
+    def test_fmt_multi_newline_before_where(self):
+        expl = '\n'.join(['the assertion',
+                          '~message here',
+                          '>assert 1',
+                          '{1 = foo',
+                          '} == 2',
+                          '{2 = bar',
+                          '}'])
+        res = '\n'.join(['the assertion',
+                         '  message here',
+                         'assert 1 == 2',
+                         ' +  where 1 = foo',
+                         ' +  and   2 = bar'])
+        assert util.format_explanation(expl) == res
+
 
 def test_python25_compile_issue257(testdir):
     testdir.makepyfile("""
@@ -289,7 +492,7 @@ def test_traceback_failure(testdir):
         def test_onefails():
             f(3)
     """)
-    result = testdir.runpytest(p1)
+    result = testdir.runpytest(p1, "--tb=long")
     result.stdout.fnmatch_lines([
         "*test_traceback_failure.py F",
         "====* FAILURES *====",
@@ -309,9 +512,28 @@ def test_traceback_failure(testdir):
         "*test_traceback_failure.py:4: AssertionError"
     ])
 
+    result = testdir.runpytest(p1) # "auto"
+    result.stdout.fnmatch_lines([
+        "*test_traceback_failure.py F",
+        "====* FAILURES *====",
+        "____*____",
+        "",
+        "    def test_onefails():",
+        ">       f(3)",
+        "",
+        "*test_*.py:6: ",
+        "",
+        "    def f(x):",
+        ">       assert x == g()",
+        "E       assert 3 == 2",
+        "E        +  where 2 = g()",
+        "",
+        "*test_traceback_failure.py:4: AssertionError"
+    ])
+
 @pytest.mark.skipif("sys.version_info < (2,5) or '__pypy__' in sys.builtin_module_names or sys.platform.startswith('java')" )
 def test_warn_missing(testdir):
-    p1 = testdir.makepyfile("")
+    testdir.makepyfile("")
     result = testdir.run(sys.executable, "-OO", "-m", "pytest", "-h")
     result.stderr.fnmatch_lines([
         "*WARNING*assert statements are not executed*",
@@ -330,7 +552,20 @@ def test_recursion_source_decode(testdir):
         [pytest]
         python_files = *.py
     """)
-    result = testdir.runpytest("--collectonly")
+    result = testdir.runpytest("--collect-only")
     result.stdout.fnmatch_lines("""
         <Module*>
+    """)
+
+def test_AssertionError_message(testdir):
+    testdir.makepyfile("""
+        def test_hello():
+            x,y = 1,2
+            assert 0, (x,y)
+    """)
+    result = testdir.runpytest()
+    result.stdout.fnmatch_lines("""
+        *def test_hello*
+        *assert 0, (x,y)*
+        *AssertionError: (1, 2)*
     """)

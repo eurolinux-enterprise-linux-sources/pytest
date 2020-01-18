@@ -15,7 +15,7 @@ def test_simple_unittest(testdir):
     assert reprec.matchreport("test_failing").failed
 
 def test_runTest_method(testdir):
-    testpath=testdir.makepyfile("""
+    testdir.makepyfile("""
         import unittest
         pytest_plugins = "pytest_unittest"
         class MyTestCaseWithRunTest(unittest.TestCase):
@@ -29,8 +29,8 @@ def test_runTest_method(testdir):
         """)
     result = testdir.runpytest("-v")
     result.stdout.fnmatch_lines("""
-        *MyTestCaseWithRunTest.runTest*
-        *MyTestCaseWithoutRunTest.test_something*
+        *MyTestCaseWithRunTest::runTest*
+        *MyTestCaseWithoutRunTest::test_something*
         *2 passed*
     """)
 
@@ -65,6 +65,45 @@ def test_setup(testdir):
     rep = reprec.matchreport("test_both", when="teardown")
     assert rep.failed and '42' in str(rep.longrepr)
 
+def test_setUpModule(testdir):
+    testpath = testdir.makepyfile("""
+        l = []
+
+        def setUpModule():
+            l.append(1)
+
+        def tearDownModule():
+            del l[0]
+
+        def test_hello():
+            assert l == [1]
+
+        def test_world():
+            assert l == [1]
+        """)
+    result = testdir.runpytest(testpath)
+    result.stdout.fnmatch_lines([
+        "*2 passed*",
+    ])
+
+def test_setUpModule_failing_no_teardown(testdir):
+    testpath = testdir.makepyfile("""
+        l = []
+
+        def setUpModule():
+            0/0
+
+        def tearDownModule():
+            l.append(1)
+
+        def test_hello():
+            pass
+    """)
+    reprec = testdir.inline_run(testpath)
+    reprec.assertoutcome(passed=0, failed=1)
+    call = reprec.getcalls("pytest_runtest_setup")[0]
+    assert not call.item.module.l
+
 def test_new_instances(testdir):
     testpath = testdir.makepyfile("""
         import unittest
@@ -96,7 +135,7 @@ def test_teardown(testdir):
     assert passed == 2
     assert passed + skipped + failed == 2
 
-@pytest.mark.skipif("sys.version_info < (3,1)")
+@pytest.mark.skipif("sys.version_info < (2,7)")
 def test_unittest_skip_issue148(testdir):
     testpath = testdir.makepyfile("""
         import unittest
@@ -197,7 +236,7 @@ def test_setup_class(testdir):
     reprec.assertoutcome(passed=3)
 
 
-@pytest.mark.multi(type=['Error', 'Failure'])
+@pytest.mark.parametrize("type", ['Error', 'Failure'])
 def test_testcase_adderrorandfailure_defers(testdir, type):
     testdir.makepyfile("""
         from unittest import TestCase
@@ -217,7 +256,7 @@ def test_testcase_adderrorandfailure_defers(testdir, type):
     result = testdir.runpytest()
     assert 'should not raise' not in result.stdout.str()
 
-@pytest.mark.multi(type=['Error', 'Failure'])
+@pytest.mark.parametrize("type", ['Error', 'Failure'])
 def test_testcase_custom_exception_info(testdir, type):
     testdir.makepyfile("""
         from unittest import TestCase
@@ -271,9 +310,10 @@ def test_module_level_pytestmark(testdir):
     reprec.assertoutcome(skipped=1)
 
 
-def test_testcase_skip_property(testdir):
+def test_trial_testcase_skip_property(testdir):
+    pytest.importorskip('twisted.trial.unittest')
     testpath = testdir.makepyfile("""
-        import unittest
+        from twisted.trial import unittest
         class MyTestCase(unittest.TestCase):
             skip = 'dont run'
             def test_func(self):
@@ -282,13 +322,41 @@ def test_testcase_skip_property(testdir):
     reprec = testdir.inline_run(testpath, "-s")
     reprec.assertoutcome(skipped=1)
 
-def test_testfunction_skip_property(testdir):
+
+def test_trial_testfunction_skip_property(testdir):
+    pytest.importorskip('twisted.trial.unittest')
     testpath = testdir.makepyfile("""
-        import unittest
+        from twisted.trial import unittest
         class MyTestCase(unittest.TestCase):
             def test_func(self):
                 pass
             test_func.skip = 'dont run'
+        """)
+    reprec = testdir.inline_run(testpath, "-s")
+    reprec.assertoutcome(skipped=1)
+
+
+def test_trial_testcase_todo_property(testdir):
+    pytest.importorskip('twisted.trial.unittest')
+    testpath = testdir.makepyfile("""
+        from twisted.trial import unittest
+        class MyTestCase(unittest.TestCase):
+            todo = 'dont run'
+            def test_func(self):
+                assert 0
+        """)
+    reprec = testdir.inline_run(testpath, "-s")
+    reprec.assertoutcome(skipped=1)
+
+
+def test_trial_testfunction_todo_property(testdir):
+    pytest.importorskip('twisted.trial.unittest')
+    testpath = testdir.makepyfile("""
+        from twisted.trial import unittest
+        class MyTestCase(unittest.TestCase):
+            def test_func(self):
+                assert 0
+            test_func.todo = 'dont run'
         """)
     reprec = testdir.inline_run(testpath, "-s")
     reprec.assertoutcome(skipped=1)
@@ -564,3 +632,72 @@ def test_unittest_setup_interaction(testdir):
     """)
     result = testdir.runpytest()
     result.stdout.fnmatch_lines("*3 passed*")
+
+
+def test_non_unittest_no_setupclass_support(testdir):
+    testpath = testdir.makepyfile("""
+        class TestFoo:
+            x = 0
+
+            @classmethod
+            def setUpClass(cls):
+                cls.x = 1
+
+            def test_method1(self):
+                assert self.x == 0
+
+            @classmethod
+            def tearDownClass(cls):
+                cls.x = 1
+
+        def test_not_teareddown():
+            assert TestFoo.x == 0
+
+    """)
+    reprec = testdir.inline_run(testpath)
+    reprec.assertoutcome(passed=2)
+
+
+def test_no_teardown_if_setupclass_failed(testdir):
+    testpath = testdir.makepyfile("""
+        import unittest
+
+        class MyTestCase(unittest.TestCase):
+            x = 0
+
+            @classmethod
+            def setUpClass(cls):
+                cls.x = 1
+                assert False
+
+            def test_func1(self):
+                cls.x = 10
+
+            @classmethod
+            def tearDownClass(cls):
+                cls.x = 100
+
+        def test_notTornDown():
+            assert MyTestCase.x == 1
+    """)
+    reprec = testdir.inline_run(testpath)
+    reprec.assertoutcome(passed=1, failed=1)
+
+
+def test_issue333_result_clearing(testdir):
+    testdir.makeconftest("""
+        def pytest_runtest_call(__multicall__, item):
+            __multicall__.execute()
+            assert 0
+    """)
+    testdir.makepyfile("""
+        import unittest
+        class TestIt(unittest.TestCase):
+            def test_func(self):
+                0/0
+    """)
+
+    reprec = testdir.inline_run()
+    reprec.assertoutcome(failed=1)
+
+

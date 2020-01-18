@@ -1,3 +1,5 @@
+import traceback
+import types
 import py
 import sys, inspect
 from compiler import parse, ast, pycodegen
@@ -55,7 +57,7 @@ class View(object):
     def __getattr__(self, attr):
         # attributes not found in the normal hierarchy rooted on View
         # are looked up in the object's real class
-        return getattr(self.__obj__, attr)
+        return getattr(object.__getattribute__(self, '__obj__'), attr)
 
     def __viewkey__(self):
         return self.__obj__.__class__
@@ -355,7 +357,18 @@ class Getattr(Interpretable):
         expr.eval(frame)
         source = '__exprinfo_expr.%s' % self.attrname
         try:
-            self.result = frame.eval(source, __exprinfo_expr=expr.result)
+            try:
+                self.result = frame.eval(source, __exprinfo_expr=expr.result)
+            except AttributeError:
+                # Maybe the attribute name needs to be mangled?
+                if (not self.attrname.startswith("__") or
+                    self.attrname.endswith("__")):
+                    raise
+                source = "getattr(__exprinfo_expr.__class__, '__name__', '')"
+                class_name = frame.eval(source, __exprinfo_expr=expr.result)
+                mangled_attr = "_" + class_name +  self.attrname
+                source = "__exprinfo_expr.%s" % (mangled_attr,)
+                self.result = frame.eval(source, __exprinfo_expr=expr.result)
         except passthroughex:
             raise
         except:
@@ -466,7 +479,7 @@ def check(s, frame=None):
 def interpret(source, frame, should_fail=False):
     module = Interpretable(parse(source, 'exec').node)
     #print "got module", module
-    if isinstance(frame, py.std.types.FrameType):
+    if isinstance(frame, types.FrameType):
         frame = py.code.Frame(frame)
     try:
         module.run(frame)
@@ -476,7 +489,6 @@ def interpret(source, frame, should_fail=False):
     except passthroughex:
         raise
     except:
-        import traceback
         traceback.print_exc()
     if should_fail:
         return ("(assertion failed, but when it was re-run for "

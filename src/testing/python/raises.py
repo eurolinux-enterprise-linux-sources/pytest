@@ -29,7 +29,7 @@ class TestRaises:
     def test_raises_flip_builtin_AssertionError(self):
         # we replace AssertionError on python level
         # however c code might still raise the builtin one
-        from _pytest.assertion.util import BuiltinAssertionError
+        from _pytest.assertion.util import BuiltinAssertionError # noqa
         pytest.raises(AssertionError,"""
             raise BuiltinAssertionError
         """)
@@ -62,3 +62,10 @@ class TestRaises:
             '*3 passed*',
         ])
 
+    def test_noclass(self):
+        with pytest.raises(TypeError):
+            pytest.raises('wrong', lambda: None)
+
+    def test_tuple(self):
+        with pytest.raises((KeyError, ValueError)):
+            raise KeyError('oops')

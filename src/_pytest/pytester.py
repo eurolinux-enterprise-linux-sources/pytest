@@ -1,15 +1,25 @@
-""" (disabled by default) support for testing py.test and py.test plugins. """
-
-import py, pytest
-import sys, os
+""" (disabled by default) support for testing pytest and pytest plugins. """
+import sys
+import os
 import codecs
 import re
-import inspect
 import time
+import platform
 from fnmatch import fnmatch
-from _pytest.main import Session, EXIT_OK
+import subprocess
+
+import py
+import pytest
 from py.builtin import print_
-from _pytest.core import HookRelay
+from _pytest.core import HookCaller, add_method_wrapper
+
+from _pytest.main import Session, EXIT_OK
+
+
+def get_public_names(l):
+    """Only return names from iterator l without a leading underscore."""
+    return [x for x in l if x[0] != "_"]
+
 
 def pytest_addoption(parser):
     group = parser.getgroup("pylib")
@@ -21,31 +31,16 @@ def pytest_addoption(parser):
 def pytest_configure(config):
     # This might be called multiple times. Only take the first.
     global _pytest_fullpath
-    import pytest
     try:
         _pytest_fullpath
     except NameError:
         _pytest_fullpath = os.path.abspath(pytest.__file__.rstrip("oc"))
         _pytest_fullpath = _pytest_fullpath.replace("$py.class", ".py")
 
-def pytest_funcarg___pytest(request):
-    return PytestArg(request)
-
-class PytestArg:
-    def __init__(self, request):
-        self.request = request
-
-    def gethookrecorder(self, hook):
-        hookrecorder = HookRecorder(hook._pm)
-        hookrecorder.start_recording(hook._hookspecs)
-        self.request.addfinalizer(hookrecorder.finish_recording)
-        return hookrecorder
 
 class ParsedCall:
-    def __init__(self, name, locals):
-        assert '_name' not in locals
-        self.__dict__.update(locals)
-        self.__dict__.pop('self')
+    def __init__(self, name, kwargs):
+        self.__dict__.update(kwargs)
         self._name = name
 
     def __repr__(self):
@@ -53,72 +48,31 @@ class ParsedCall:
         del d['_name']
         return "<ParsedCall %r(**%r)>" %(self._name, d)
 
+
 class HookRecorder:
     def __init__(self, pluginmanager):
         self._pluginmanager = pluginmanager
         self.calls = []
-        self._recorders = {}
 
-    def start_recording(self, hookspecs):
-        if not isinstance(hookspecs, (list, tuple)):
-            hookspecs = [hookspecs]
-        for hookspec in hookspecs:
-            assert hookspec not in self._recorders
-            class RecordCalls:
-                _recorder = self
-            for name, method in vars(hookspec).items():
-                if name[0] != "_":
-                    setattr(RecordCalls, name, self._makecallparser(method))
-            recorder = RecordCalls()
-            self._recorders[hookspec] = recorder
-            self._pluginmanager.register(recorder)
-        self.hook = HookRelay(hookspecs, pm=self._pluginmanager,
-            prefix="pytest_")
+        def _docall(hookcaller, methods, kwargs):
+            self.calls.append(ParsedCall(hookcaller.name, kwargs))
+            yield
+        self._undo_wrapping = add_method_wrapper(HookCaller, _docall)
+        pluginmanager.add_shutdown(self._undo_wrapping)
 
     def finish_recording(self):
-        for recorder in self._recorders.values():
-            self._pluginmanager.unregister(recorder)
-        self._recorders.clear()
-
-    def _makecallparser(self, method):
-        name = method.__name__
-        args, varargs, varkw, default = py.std.inspect.getargspec(method)
-        if not args or args[0] != "self":
-            args.insert(0, 'self')
-        fspec = py.std.inspect.formatargspec(args, varargs, varkw, default)
-        # we use exec because we want to have early type
-        # errors on wrong input arguments, using
-        # *args/**kwargs delays this and gives errors
-        # elsewhere
-        exec (py.code.compile("""
-            def %(name)s%(fspec)s:
-                        self._recorder.calls.append(
-                            ParsedCall(%(name)r, locals()))
-        """ % locals()))
-        return locals()[name]
+        self._undo_wrapping()
 
     def getcalls(self, names):
         if isinstance(names, str):
             names = names.split()
-        for name in names:
-            for cls in self._recorders:
-                if name in vars(cls):
-                    break
-            else:
-                raise ValueError("callname %r not found in %r" %(
-                name, self._recorders.keys()))
-        l = []
-        for call in self.calls:
-            if call._name in names:
-                l.append(call)
-        return l
+        return [call for call in self.calls if call._name in names]
 
-    def contains(self, entries):
+    def assert_contains(self, entries):
         __tracebackhide__ = True
-        from py.builtin import print_
         i = 0
         entries = list(entries)
-        backlocals = py.std.sys._getframe(1).f_locals
+        backlocals = sys._getframe(1).f_locals
         while entries:
             name, check = entries.pop(0)
             for ind, call in enumerate(self.calls[i:]):
@@ -133,7 +87,7 @@ class HookRecorder:
                     break
                 print_("NONAMEMATCH", name, "with", call)
             else:
-                py.test.fail("could not find %r check %r" % (name, check))
+                pytest.fail("could not find %r check %r" % (name, check))
 
     def popcall(self, name):
         __tracebackhide__ = True
@@ -143,12 +97,75 @@ class HookRecorder:
                 return call
         lines = ["could not find call %r, in:" % (name,)]
         lines.extend(["  %s" % str(x) for x in self.calls])
-        py.test.fail("\n".join(lines))
+        pytest.fail("\n".join(lines))
 
     def getcall(self, name):
         l = self.getcalls(name)
         assert len(l) == 1, (name, l)
         return l[0]
+
+    # functionality for test reports
+
+    def getreports(self,
+                   names="pytest_runtest_logreport pytest_collectreport"):
+        return [x.report for x in self.getcalls(names)]
+
+    def matchreport(self, inamepart="",
+        names="pytest_runtest_logreport pytest_collectreport", when=None):
+        """ return a testreport whose dotted import path matches """
+        l = []
+        for rep in self.getreports(names=names):
+            try:
+                if not when and rep.when != "call" and rep.passed:
+                    # setup/teardown passing reports - let's ignore those
+                    continue
+            except AttributeError:
+                pass
+            if when and getattr(rep, 'when', None) != when:
+                continue
+            if not inamepart or inamepart in rep.nodeid.split("::"):
+                l.append(rep)
+        if not l:
+            raise ValueError("could not find test report matching %r: "
+                             "no test reports at all!" % (inamepart,))
+        if len(l) > 1:
+            raise ValueError(
+                "found 2 or more testreports matching %r: %s" %(inamepart, l))
+        return l[0]
+
+    def getfailures(self,
+                    names='pytest_runtest_logreport pytest_collectreport'):
+        return [rep for rep in self.getreports(names) if rep.failed]
+
+    def getfailedcollections(self):
+        return self.getfailures('pytest_collectreport')
+
+    def listoutcomes(self):
+        passed = []
+        skipped = []
+        failed = []
+        for rep in self.getreports(
+            "pytest_collectreport pytest_runtest_logreport"):
+            if rep.passed:
+                if getattr(rep, "when", None) == "call":
+                    passed.append(rep)
+            elif rep.skipped:
+                skipped.append(rep)
+            elif rep.failed:
+                failed.append(rep)
+        return passed, skipped, failed
+
+    def countoutcomes(self):
+        return [len(x) for x in self.listoutcomes()]
+
+    def assertoutcome(self, passed=0, skipped=0, failed=0):
+        realpassed, realskipped, realfailed = self.listoutcomes()
+        assert passed == len(realpassed)
+        assert skipped == len(realskipped)
+        assert failed == len(realfailed)
+
+    def clear(self):
+        self.calls[:] = []
 
 
 def pytest_funcarg__linecomp(request):
@@ -185,7 +202,6 @@ class TmpTestdir:
     def __init__(self, request):
         self.request = request
         self.Config = request.config.__class__
-        self._pytest = request.getfuncargvalue("_pytest")
         # XXX remove duplication with tmpdir plugin
         basetmp = request.config._tmpdirhandler.ensuretemp("testdir")
         name = request.function.__name__
@@ -206,7 +222,7 @@ class TmpTestdir:
 
     def finalize(self):
         for p in self._syspathremove:
-            py.std.sys.path.remove(p)
+            sys.path.remove(p)
         if hasattr(self, '_olddir'):
             self._olddir.chdir()
         # delete modules that have been loaded from tmpdir
@@ -216,15 +232,10 @@ class TmpTestdir:
                 if fn and fn.startswith(str(self.tmpdir)):
                     del sys.modules[name]
 
-    def getreportrecorder(self, obj):
-        if hasattr(obj, 'config'):
-            obj = obj.config
-        if hasattr(obj, 'hook'):
-            obj = obj.hook
-        assert hasattr(obj, '_hookspecs'), obj
-        reprec = ReportRecorder(obj)
-        reprec.hookrecorder = self._pytest.gethookrecorder(obj)
-        reprec.hook = reprec.hookrecorder.hook
+    def make_hook_recorder(self, pluginmanager):
+        assert not hasattr(pluginmanager, "reprec")
+        pluginmanager.reprec = reprec = HookRecorder(pluginmanager)
+        self.request.addfinalizer(reprec.finish_recording)
         return reprec
 
     def chdir(self):
@@ -242,8 +253,14 @@ class TmpTestdir:
         ret = None
         for name, value in items:
             p = self.tmpdir.join(name).new(ext=ext)
-            source = py.builtin._totext(py.code.Source(value)).strip()
-            content = source.encode("utf-8") # + "\n"
+            source = py.code.Source(value)
+            def my_totext(s, encoding="utf-8"):
+                if py.builtin._isbytes(s):
+                    s = py.builtin._totext(s, encoding=encoding)
+                return s
+            source_unicode = "\n".join([my_totext(line) for line in source.lines])
+            source = py.builtin._totext(source_unicode)
+            content = source.strip().encode("utf-8") # + "\n"
             #content = content.rstrip() + "\n"
             p.write(content, "wb")
             if ret is None:
@@ -253,9 +270,6 @@ class TmpTestdir:
 
     def makefile(self, ext, *args, **kwargs):
         return self._makefile(ext, args, kwargs)
-
-    def makeini(self, source):
-        return self.makefile('cfg', setup=source)
 
     def makeconftest(self, source):
         return self.makepyfile(conftest=source)
@@ -276,7 +290,7 @@ class TmpTestdir:
     def syspathinsert(self, path=None):
         if path is None:
             path = self.tmpdir
-        py.std.sys.path.insert(0, str(path))
+        sys.path.insert(0, str(path))
         self._syspathremove.append(str(path))
 
     def mkdir(self, name):
@@ -292,9 +306,8 @@ class TmpTestdir:
         session = Session(config)
         assert '::' not in str(arg)
         p = py.path.local(arg)
-        x = session.fspath.bestrelpath(p)
         config.hook.pytest_sessionstart(session=session)
-        res = session.perform_collect([x], genitems=False)[0]
+        res = session.perform_collect([str(p)], genitems=False)[0]
         config.hook.pytest_sessionfinish(session=session, exitstatus=EXIT_OK)
         return res
 
@@ -340,26 +353,23 @@ class TmpTestdir:
     def inline_genitems(self, *args):
         return self.inprocess_run(list(args) + ['--collectonly'])
 
-    def inline_run(self, *args):
-        items, rec = self.inprocess_run(args)
-        return rec
+    def inprocess_run(self, args, plugins=()):
+        rec = self.inline_run(*args, plugins=plugins)
+        items = [x.item for x in rec.getcalls("pytest_itemcollected")]
+        return items, rec
 
-    def inprocess_run(self, args, plugins=None):
+    def inline_run(self, *args, **kwargs):
         rec = []
-        items = []
         class Collect:
             def pytest_configure(x, config):
-                rec.append(self.getreportrecorder(config))
-            def pytest_itemcollected(self, item):
-                items.append(item)
-        if not plugins:
-            plugins = []
+                rec.append(self.make_hook_recorder(config.pluginmanager))
+        plugins = kwargs.get("plugins") or []
         plugins.append(Collect())
-        ret = self.pytestmain(list(args), plugins=plugins)
+        ret = pytest.main(list(args), plugins=plugins)
+        assert len(rec) == 1
         reprec = rec[0]
         reprec.ret = ret
-        assert len(rec) == 1
-        return items, reprec
+        return reprec
 
     def parseconfig(self, *args):
         args = [str(x) for x in args]
@@ -368,23 +378,23 @@ class TmpTestdir:
                 break
         else:
             args.append("--basetemp=%s" % self.tmpdir.dirpath('basetemp'))
-        import _pytest.core
-        config = _pytest.core._prepareconfig(args, self.plugins)
-        # the in-process pytest invocation needs to avoid leaking FDs
-        # so we register a "reset_capturings" callmon the capturing manager
-        # and make sure it gets called
-        config._cleanup.append(
-            config.pluginmanager.getplugin("capturemanager").reset_capturings)
         import _pytest.config
-        self.request.addfinalizer(
-            lambda: _pytest.config.pytest_unconfigure(config))
+        config = _pytest.config._prepareconfig(args, self.plugins)
+        # we don't know what the test will do with this half-setup config
+        # object and thus we make sure it gets unconfigured properly in any
+        # case (otherwise capturing could still be active, for example)
+        def ensure_unconfigure():
+            if hasattr(config.pluginmanager, "_config"):
+                config.pluginmanager.do_unconfigure(config)
+            config.pluginmanager.ensure_shutdown()
+
+        self.request.addfinalizer(ensure_unconfigure)
         return config
 
     def parseconfigure(self, *args):
         config = self.parseconfig(*args)
-        config.pluginmanager.do_configure(config)
-        self.request.addfinalizer(lambda:
-        config.pluginmanager.do_unconfigure(config))
+        config.do_configure()
+        self.request.addfinalizer(config.do_unconfigure)
         return config
 
     def getitem(self,  source, funcname="test_func"):
@@ -418,20 +428,8 @@ class TmpTestdir:
         env['PYTHONPATH'] = os.pathsep.join(filter(None, [
             str(os.getcwd()), env.get('PYTHONPATH', '')]))
         kw['env'] = env
-        #print "env", env
-        return py.std.subprocess.Popen(cmdargs,
-                                       stdout=stdout, stderr=stderr, **kw)
-
-    def pytestmain(self, *args, **kwargs):
-        class ResetCapturing:
-            @pytest.mark.trylast
-            def pytest_unconfigure(self, config):
-                capman = config.pluginmanager.getplugin("capturemanager")
-                capman.reset_capturings()
-        plugins = kwargs.setdefault("plugins", [])
-        rc = ResetCapturing()
-        plugins.append(rc)
-        return pytest.main(*args, **kwargs)
+        return subprocess.Popen(cmdargs,
+                                stdout=stdout, stderr=stderr, **kw)
 
     def run(self, *cmdargs):
         return self._run(*cmdargs)
@@ -476,12 +474,12 @@ class TmpTestdir:
 
     def _getpybinargs(self, scriptname):
         if not self.request.config.getvalue("notoolsonpath"):
-            # XXX we rely on script refering to the correct environment
-            # we cannot use "(py.std.sys.executable,script)"
-            # becaue on windows the script is e.g. a py.test.exe
-            return (py.std.sys.executable, _pytest_fullpath,)
+            # XXX we rely on script referring to the correct environment
+            # we cannot use "(sys.executable,script)"
+            # because on windows the script is e.g. a py.test.exe
+            return (sys.executable, _pytest_fullpath,) # noqa
         else:
-            py.test.skip("cannot run %r with --no-tools-on-path" % scriptname)
+            pytest.skip("cannot run %r with --no-tools-on-path" % scriptname)
 
     def runpython(self, script, prepend=True):
         if prepend:
@@ -499,7 +497,7 @@ class TmpTestdir:
 
     def runpython_c(self, command):
         command = self._getsysprepend() + command
-        return self.run(py.std.sys.executable, "-c", command)
+        return self.run(sys.executable, "-c", command)
 
     def runpytest(self, *args):
         p = py.path.local.make_numbered_dir(prefix="runpytest-",
@@ -518,22 +516,23 @@ class TmpTestdir:
 
     def spawn_pytest(self, string, expect_timeout=10.0):
         if self.request.config.getvalue("notoolsonpath"):
-            py.test.skip("--no-tools-on-path prevents running pexpect-spawn tests")
+            pytest.skip("--no-tools-on-path prevents running pexpect-spawn tests")
         basetemp = self.tmpdir.mkdir("pexpect")
         invoke = " ".join(map(str, self._getpybinargs("py.test")))
         cmd = "%s --basetemp=%s %s" % (invoke, basetemp, string)
         return self.spawn(cmd, expect_timeout=expect_timeout)
 
     def spawn(self, cmd, expect_timeout=10.0):
-        pexpect = py.test.importorskip("pexpect", "2.4")
-        if hasattr(sys, 'pypy_version_info') and '64' in py.std.platform.machine():
+        pexpect = pytest.importorskip("pexpect", "3.0")
+        if hasattr(sys, 'pypy_version_info') and '64' in platform.machine():
             pytest.skip("pypy-64 bit not supported")
         if sys.platform == "darwin":
             pytest.xfail("pexpect does not work reliably on darwin?!")
         if sys.platform.startswith("freebsd"):
             pytest.xfail("pexpect does not work reliably on freebsd")
-        logfile = self.tmpdir.join("spawn.out")
-        child = pexpect.spawn(cmd, logfile=logfile.open("w"))
+        logfile = self.tmpdir.join("spawn.out").open("wb")
+        child = pexpect.spawn(cmd, logfile=logfile)
+        self.request.addfinalizer(logfile.close)
         child.timeout = expect_timeout
         return child
 
@@ -544,85 +543,6 @@ def getdecoded(out):
             return "INTERNAL not-utf8-decodeable, truncated string:\n%s" % (
                     py.io.saferepr(out),)
 
-class ReportRecorder(object):
-    def __init__(self, hook):
-        self.hook = hook
-        self.pluginmanager = hook._pm
-        self.pluginmanager.register(self)
-
-    def getcall(self, name):
-        return self.hookrecorder.getcall(name)
-
-    def popcall(self, name):
-        return self.hookrecorder.popcall(name)
-
-    def getcalls(self, names):
-        """ return list of ParsedCall instances matching the given eventname. """
-        return self.hookrecorder.getcalls(names)
-
-    # functionality for test reports
-
-    def getreports(self, names="pytest_runtest_logreport pytest_collectreport"):
-        return [x.report for x in self.getcalls(names)]
-
-    def matchreport(self, inamepart="",
-        names="pytest_runtest_logreport pytest_collectreport", when=None):
-        """ return a testreport whose dotted import path matches """
-        l = []
-        for rep in self.getreports(names=names):
-            try:
-                if not when and rep.when != "call" and rep.passed:
-                    # setup/teardown passing reports - let's ignore those
-                    continue
-            except AttributeError:
-                pass
-            if when and getattr(rep, 'when', None) != when:
-                continue
-            if not inamepart or inamepart in rep.nodeid.split("::"):
-                l.append(rep)
-        if not l:
-            raise ValueError("could not find test report matching %r: no test reports at all!" %
-                (inamepart,))
-        if len(l) > 1:
-            raise ValueError("found more than one testreport matching %r: %s" %(
-                             inamepart, l))
-        return l[0]
-
-    def getfailures(self, names='pytest_runtest_logreport pytest_collectreport'):
-        return [rep for rep in self.getreports(names) if rep.failed]
-
-    def getfailedcollections(self):
-        return self.getfailures('pytest_collectreport')
-
-    def listoutcomes(self):
-        passed = []
-        skipped = []
-        failed = []
-        for rep in self.getreports("pytest_runtest_logreport"):
-            if rep.passed:
-                if rep.when == "call":
-                    passed.append(rep)
-            elif rep.skipped:
-                skipped.append(rep)
-            elif rep.failed:
-                failed.append(rep)
-        return passed, skipped, failed
-
-    def countoutcomes(self):
-        return [len(x) for x in self.listoutcomes()]
-
-    def assertoutcome(self, passed=0, skipped=0, failed=0):
-        realpassed, realskipped, realfailed = self.listoutcomes()
-        assert passed == len(realpassed)
-        assert skipped == len(realskipped)
-        assert failed == len(realfailed)
-
-    def clear(self):
-        self.hookrecorder.calls[:] = []
-
-    def unregister(self):
-        self.pluginmanager.unregister(self)
-        self.hookrecorder.finish_recording()
 
 class LineComp:
     def __init__(self):
@@ -663,9 +583,15 @@ class LineMatcher:
             else:
                 raise ValueError("line %r not found in output" % line)
 
+    def get_lines_after(self, fnline):
+        for i, line in enumerate(self.lines):
+            if fnline == line or fnmatch(line, fnline):
+                return self.lines[i+1:]
+        raise ValueError("line %r not found in output" % fnline)
+
     def fnmatch_lines(self, lines2):
         def show(arg1, arg2):
-            py.builtin.print_(arg1, arg2, file=py.std.sys.stderr)
+            py.builtin.print_(arg1, arg2, file=sys.stderr)
         lines2 = self._getlines(lines2)
         lines1 = self.lines[:]
         nextline = None
@@ -689,4 +615,4 @@ class LineMatcher:
                     show("    and:", repr(nextline))
                 extralines.append(nextline)
             else:
-                py.test.fail("remains unmatched: %r, see stderr" % (line,))
+                pytest.fail("remains unmatched: %r, see stderr" % (line,))

@@ -1,4 +1,3 @@
-
 .. _toc:
 
 Full pytest documentation
@@ -14,9 +13,10 @@ Full pytest documentation
    overview
    apiref
    plugins
+   plugins_index/index
    example/index
    talks
-   develop
+   contributing
    funcarg_compare.txt
    announce/index
 

@@ -1,8 +1,7 @@
 import pytest
 import sys
 
-from _pytest.skipping import MarkEvaluator, folded_skips
-from _pytest.skipping import pytest_runtest_setup
+from _pytest.skipping import MarkEvaluator, folded_skips, pytest_runtest_setup
 from _pytest.runner import runtestprotocol
 
 class TestEvaluator:
@@ -100,6 +99,17 @@ class TestEvaluator:
         expl = ev.getexplanation()
         assert expl == "condition: not hasattr(os, 'murks')"
 
+    def test_marked_skip_with_not_string(self, testdir):
+        item = testdir.getitem("""
+            import pytest
+            @pytest.mark.skipif(False)
+            def test_func():
+                pass
+        """)
+        ev = MarkEvaluator(item, 'skipif')
+        exc = pytest.raises(pytest.fail.Exception, ev.istrue)
+        assert """Failed: you need to specify reason=STRING when using booleans as conditions.""" in exc.value.msg
+
     def test_skipif_class(self, testdir):
         item, = testdir.getitems("""
             import pytest
@@ -148,13 +158,14 @@ class TestXFail:
             @pytest.mark.xfail
             def test_func():
                 assert 0
+            def test_func2():
+                pytest.xfail("hello")
         """)
         result = testdir.runpytest("--runxfail")
-        assert result.ret == 1
         result.stdout.fnmatch_lines([
             "*def test_func():*",
             "*assert 0*",
-            "*1 failed*",
+            "*1 failed*1 pass*",
         ])
 
     def test_xfail_evalfalse_but_fails(self, testdir):
@@ -177,7 +188,7 @@ class TestXFail:
             def test_this():
                 assert 0
         """)
-        result = testdir.runpytest(p, '-v')
+        testdir.runpytest(p, '-v')
         #result.stdout.fnmatch_lines([
         #    "*HINT*use*-r*"
         #])
@@ -250,10 +261,7 @@ class TestXFail:
             "*reason:*hello*",
         ])
         result = testdir.runpytest(p, "--runxfail")
-        result.stdout.fnmatch_lines([
-            "*def test_this():*",
-            "*pytest.xfail*",
-        ])
+        result.stdout.fnmatch_lines("*1 pass*")
 
     def test_xfail_imperative_in_setup_function(self, testdir):
         p = testdir.makepyfile("""
@@ -274,10 +282,10 @@ class TestXFail:
             "*reason:*hello*",
         ])
         result = testdir.runpytest(p, "--runxfail")
-        result.stdout.fnmatch_lines([
-            "*def setup_function(function):*",
-            "*pytest.xfail*",
-        ])
+        result.stdout.fnmatch_lines("""
+            *def test_this*
+            *1 fail*
+        """)
 
     def xtest_dynamic_xfail_set_during_setup(self, testdir):
         p = testdir.makepyfile("""
@@ -322,6 +330,26 @@ class TestXFail:
             "*1 xfailed*",
         ])
 
+
+    @pytest.mark.parametrize('expected, actual, matchline',
+                             [('TypeError', 'TypeError', "*1 xfailed*"),
+                              ('(AttributeError, TypeError)', 'TypeError', "*1 xfailed*"),
+                              ('TypeError', 'IndexError', "*1 failed*"),
+                              ('(AttributeError, TypeError)', 'IndexError', "*1 failed*"),
+                              ])
+    def test_xfail_raises(self, expected, actual, matchline, testdir):
+        p = testdir.makepyfile("""
+            import pytest
+            @pytest.mark.xfail(raises=%s)
+            def test_raises():
+                raise %s()
+        """ % (expected, actual))
+        result = testdir.runpytest(p)
+        result.stdout.fnmatch_lines([
+            matchline,
+        ])
+
+
 class TestXFailwithSetupTeardown:
     def test_failing_setup_issue9(self, testdir):
         testdir.makepyfile("""
@@ -361,8 +389,9 @@ class TestSkipif:
             @pytest.mark.skipif("hasattr(os, 'sep')")
             def test_func():
                 pass
-        """)
-        x = pytest.raises(pytest.skip.Exception, "pytest_runtest_setup(item)")
+        """) # noqa
+        x = pytest.raises(pytest.skip.Exception, lambda:
+                          pytest_runtest_setup(item))
         assert x.value.msg == "condition: hasattr(os, 'sep')"
 
 
@@ -566,9 +595,8 @@ def test_default_markers(testdir):
     result = testdir.runpytest("--markers")
     result.stdout.fnmatch_lines([
         "*skipif(*condition)*skip*",
-        "*xfail(*condition, reason=None, run=True)*expected failure*",
+        "*xfail(*condition, reason=None, run=True, raises=None)*expected failure*",
     ])
-
 
 def test_xfail_test_setup_exception(testdir):
     testdir.makeconftest("""
@@ -609,4 +637,64 @@ def test_imperativeskip_on_xfail_test(testdir):
         *2 skipped*
     """)
 
+class TestBooleanCondition:
+    def test_skipif(self, testdir):
+        testdir.makepyfile("""
+            import pytest
+            @pytest.mark.skipif(True, reason="True123")
+            def test_func1():
+                pass
+            @pytest.mark.skipif(False, reason="True123")
+            def test_func2():
+                pass
+        """)
+        result = testdir.runpytest()
+        result.stdout.fnmatch_lines("""
+            *1 passed*1 skipped*
+        """)
 
+    def test_skipif_noreason(self, testdir):
+        testdir.makepyfile("""
+            import pytest
+            @pytest.mark.skipif(True)
+            def test_func():
+                pass
+        """)
+        result = testdir.runpytest("-rs")
+        result.stdout.fnmatch_lines("""
+            *1 error*
+        """)
+
+    def test_xfail(self, testdir):
+        testdir.makepyfile("""
+            import pytest
+            @pytest.mark.xfail(True, reason="True123")
+            def test_func():
+                assert 0
+        """)
+        result = testdir.runpytest("-rxs")
+        result.stdout.fnmatch_lines("""
+            *XFAIL*
+            *True123*
+            *1 xfail*
+        """)
+
+
+def test_xfail_item(testdir):
+    # Ensure pytest.xfail works with non-Python Item
+    testdir.makeconftest("""
+        import pytest
+
+        class MyItem(pytest.Item):
+            nodeid = 'foo'
+            def runtest(self):
+                pytest.xfail("Expected Failure")
+
+        def pytest_collect_file(path, parent):
+            return MyItem("foo", parent)
+    """)
+    result = testdir.inline_run()
+    passed, skipped, failed = result.listoutcomes()
+    assert not failed
+    xfailed = [r for r in skipped if hasattr(r, 'wasxfail')]
+    assert xfailed

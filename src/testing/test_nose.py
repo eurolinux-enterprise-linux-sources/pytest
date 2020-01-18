@@ -1,7 +1,7 @@
-import py, pytest
+import pytest
 
 def setup_module(mod):
-    mod.nose = py.test.importorskip("nose")
+    mod.nose = pytest.importorskip("nose")
 
 def test_nose_setup(testdir):
     p = testdir.makepyfile("""
@@ -96,7 +96,7 @@ def test_nose_setup_func_failure(testdir):
 
 
 def test_nose_setup_func_failure_2(testdir):
-    p = testdir.makepyfile("""
+    testdir.makepyfile("""
         l = []
 
         my_setup = 1
@@ -112,7 +112,7 @@ def test_nose_setup_func_failure_2(testdir):
     reprec.assertoutcome(passed=1)
 
 def test_nose_setup_partial(testdir):
-    py.test.importorskip("functools")
+    pytest.importorskip("functools")
     p = testdir.makepyfile("""
         from functools import partial
 
@@ -327,6 +327,29 @@ def test_setup_teardown_linking_issue265(testdir):
                 """Undoes the setup."""
                 raise Exception("should not call teardown for skipped tests")
         ''')
+    reprec = testdir.inline_run()
+    reprec.assertoutcome(passed=1, skipped=1)
 
-    result = testdir.runpytest()
-    result.stdout.fnmatch_lines("*1 skipped*")
+
+def test_SkipTest_during_collection(testdir):
+    p = testdir.makepyfile("""
+        import nose
+        raise nose.SkipTest("during collection")
+        def test_failing():
+            assert False
+        """)
+    result = testdir.runpytest(p)
+    outcome = result.parseoutcomes()
+    outcome.pop('seconds')
+    assert outcome == dict(skipped=1)
+
+
+def test_SkipTest_in_test(testdir):
+    testdir.makepyfile("""
+        import nose
+
+        def test_skipping():
+            raise nose.SkipTest("in test")
+        """)
+    reprec = testdir.inline_run()
+    reprec.assertoutcome(skipped=1)

@@ -1,15 +1,33 @@
 .. _projects:
 
+.. image:: img/gaynor3.png
+   :width: 400px
+   :align: right
+
+.. image:: img/theuni.png
+   :width: 400px
+   :align: right
+
+.. image:: img/cramer2.png
+   :width: 400px
+   :align: right
+
+.. image:: img/keleshev.png
+   :width: 400px
+   :align: right
+
+
 Project examples
 ==========================
 
-Here are some examples of projects using py.test (please send notes via :ref:`contact`):
+Here are some examples of projects using ``pytest`` (please send notes via :ref:`contact`):
 
-* `PyPy <http://pypy.org>`_, Python with a JIT compiler, running over 
-  `16000 tests <http://buildbot.pypy.org/summary?branch=%3Ctrunk%3E>`_
+* `PyPy <http://pypy.org>`_, Python with a JIT compiler, running over
+  `21000 tests <http://buildbot.pypy.org/summary?branch=%3Ctrunk%3E>`_
 * the `MoinMoin <http://moinmo.in>`_ Wiki Engine
 * `sentry <https://getsentry.com/welcome/>`_, realtime app-maintenance and exception tracking
-* `tox <http://codespeak.net/tox>`_, virtualenv/Hudson integration tool
+* `Astropy <http://www.astropy.org/>`_ and `affiliated packages <http://www.astropy.org/affiliated/index.html>`_
+* `tox <http://testrun.org/tox>`_, virtualenv/Hudson integration tool
 * `PIDA <http://pida.co.uk>`_ framework for integrated development
 * `PyPM <http://code.activestate.com/pypm/>`_ ActiveState's package manager
 * `Fom <http://packages.python.org/Fom/>`_ a fluid object mapper for FluidDB
@@ -43,15 +61,15 @@ Here are some examples of projects using py.test (please send notes via :ref:`co
 * `pytest-localserver <https://bitbucket.org/basti/pytest-localserver/>`_ a plugin for pytest that provides a httpserver and smtpserver
 * `pytest-monkeyplus <http://pypi.python.org/pypi/pytest-monkeyplus/>`_ a plugin that extends monkeypatch
 
-These projects help integrate py.test into other Python frameworks:
+These projects help integrate ``pytest`` into other Python frameworks:
 
 * `pytest-django <http://pypi.python.org/pypi/pytest-django/>`_ for Django
 * `zope.pytest <http://packages.python.org/zope.pytest/>`_ for Zope and Grok
-* `pytest__gae <http://pypi.python.org/pypi/pytest_gae/0.2.1>`_ for Google App Engine
-* There is `some work <https://github.com/Pylons/Kotti/pull/101>`_ underway for Kotti, a CMS built in Pyramid/Pylons
+* `pytest_gae <http://pypi.python.org/pypi/pytest_gae/0.2.1>`_ for Google App Engine
+* There is `some work <https://github.com/Kotti/Kotti/blob/master/kotti/testing.py>`_ underway for Kotti, a CMS built in Pyramid/Pylons
 
 
-Some organisations using py.test
+Some organisations using pytest
 -----------------------------------
 
 * `Square Kilometre Array, Cape Town <http://ska.ac.za/>`_
@@ -61,6 +79,6 @@ Some organisations using py.test
 * `Stups department of Heinrich Heine University Duesseldorf <http://www.stups.uni-duesseldorf.de/projects.php>`_
 * `cellzome <http://www.cellzome.com/>`_
 * `Open End, Gothenborg <http://www.openend.se>`_
-* `Laboraratory of Bioinformatics, Warsaw <http://genesilico.pl/>`_
+* `Laboratory of Bioinformatics, Warsaw <http://genesilico.pl/>`_
 * `merlinux, Germany <http://merlinux.eu>`_
 * many more ... (please be so kind to send a note via :ref:`contact`)

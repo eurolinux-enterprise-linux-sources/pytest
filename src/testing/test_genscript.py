@@ -1,10 +1,10 @@
-import py, os, sys
-import subprocess
+import pytest
+import sys
 
 
-def pytest_funcarg__standalone(request):
-    return request.cached_setup(scope="module",
-        setup=lambda: Standalone(request))
+@pytest.fixture(scope="module")
+def standalone(request):
+    return Standalone(request)
 
 class Standalone:
     def __init__(self, request):
@@ -20,6 +20,13 @@ class Standalone:
         return testdir._run(anypython, self.script, *args)
 
 def test_gen(testdir, anypython, standalone):
+    if sys.version_info >= (2,7):
+        result = testdir._run(anypython, "-c",
+                                "import sys;print (sys.version_info >=(2,7))")
+        assert result.ret == 0
+        if result.stdout.str() == "False":
+            pytest.skip("genscript called from python2.7 cannot work "
+                        "earlier python versions")
     result = standalone.run(anypython, testdir, '--version')
     assert result.ret == 0
     result.stderr.fnmatch_lines([
@@ -29,14 +36,13 @@ def test_gen(testdir, anypython, standalone):
     result = standalone.run(anypython, testdir, p)
     assert result.ret != 0
 
-def test_rundist(testdir, pytestconfig, standalone):
-    pytestconfig.pluginmanager.skipifmissing("xdist")
-    testdir.makepyfile("""
-        def test_one():
-            pass
-    """)
-    result = standalone.run(sys.executable, testdir, '-n', '3')
-    assert result.ret == 0
-    result.stdout.fnmatch_lines([
-        "*1 passed*",
-    ])
+
+def test_freeze_includes():
+    """
+    Smoke test for freeze_includes(), to ensure that it works across all
+    supported python versions.
+    """
+    includes = pytest.freeze_includes()
+    assert len(includes) > 1
+    assert '_pytest.genscript' in includes
+

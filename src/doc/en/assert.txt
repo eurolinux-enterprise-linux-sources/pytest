@@ -10,7 +10,7 @@ The writing and reporting of assertions in tests
 Asserting with the ``assert`` statement
 ---------------------------------------------------------
 
-``py.test`` allows you to use the standard python ``assert`` for verifying
+``pytest`` allows you to use the standard python ``assert`` for verifying
 expectations and values in Python tests.  For example, you can write the
 following::
 
@@ -26,7 +26,8 @@ you will see the return value of the function call::
 
     $ py.test test_assert1.py
     =========================== test session starts ============================
-    platform linux2 -- Python 2.7.3 -- pytest-2.3.5
+    platform linux -- Python 3.4.0 -- py-1.4.26 -- pytest-2.7.0
+    rootdir: /tmp/doc-exec-98, inifile: 
     collected 1 items
     
     test_assert1.py F
@@ -42,7 +43,7 @@ you will see the return value of the function call::
     test_assert1.py:5: AssertionError
     ========================= 1 failed in 0.01 seconds =========================
 
-py.test has support for showing the values of the most common subexpressions
+``pytest`` has support for showing the values of the most common subexpressions
 including calls, attributes, comparisons, and binary and unary
 operators. (See :ref:`tbreportdemo`).  This allows you to use the
 idiomatic python constructs without boilerplate code while not losing
@@ -66,17 +67,26 @@ In order to write assertions about raised exceptions, you can use
 ``pytest.raises`` as a context manager like this::
 
     import pytest
-    with pytest.raises(ZeroDivisionError):
-        1 / 0
+
+    def test_zero_division():
+        with pytest.raises(ZeroDivisionError):
+            1 / 0
 
 and if you need to have access to the actual exception info you may use::
 
-    with pytest.raises(RuntimeError) as excinfo:
-        def f():
+    def test_recursion_depth():
+        with pytest.raises(RuntimeError) as excinfo:
+            def f():
+                f()
             f()
-        f()
+        assert 'maximum recursion' in str(excinfo.value)
 
-    # do checks related to excinfo.type, excinfo.value, excinfo.traceback
+``excinfo`` is a `py.code.ExceptionInfo`_ instance, which is a wrapper around
+the actual exception raised.  The main attributes of interest are
+``.type``, ``.value`` and ``.traceback``.
+
+.. _py.code.ExceptionInfo:
+    http://pylib.readthedocs.org/en/latest/code.html#py-code-exceptioninfo
 
 If you want to write test code that works on Python 2.4 as well,
 you may also use two other ways to test for an expected exception::
@@ -89,6 +99,22 @@ asserts that the given ``ExpectedException`` is raised.  The reporter will
 provide you with helpful output in case of failures such as *no
 exception* or *wrong exception*.
 
+Note that it is also possible to specify a "raises" argument to
+``pytest.mark.xfail``, which checks that the test is failing in a more
+specific way than just having any exception raised::
+
+    @pytest.mark.xfail(raises=IndexError)
+    def test_f():
+        f()
+
+Using ``pytest.raises`` is likely to be better for cases where you are testing
+exceptions your own code is deliberately raising, whereas using
+``@pytest.mark.xfail`` with a check function is probably better for something
+like documenting unfixed bugs (where the test describes what "should" happen)
+or bugs in dependencies.
+
+
+
 .. _newreport:
 
 Making use of context-sensitive comparisons
@@ -96,7 +122,7 @@ Making use of context-sensitive comparisons
 
 .. versionadded:: 2.0
 
-py.test has rich support for providing context-sensitive information
+``pytest`` has rich support for providing context-sensitive information
 when it encounters comparisons.  For example::
 
     # content of test_assert2.py
@@ -110,7 +136,8 @@ if you run this module::
 
     $ py.test test_assert2.py
     =========================== test session starts ============================
-    platform linux2 -- Python 2.7.3 -- pytest-2.3.5
+    platform linux -- Python 3.4.0 -- py-1.4.26 -- pytest-2.7.0
+    rootdir: /tmp/doc-exec-98, inifile: 
     collected 1 items
     
     test_assert2.py F
@@ -127,6 +154,7 @@ if you run this module::
     E         '1'
     E         Extra items in the right set:
     E         '5'
+    E         Use -v to get the full diff
     
     test_assert2.py:5: AssertionError
     ========================= 1 failed in 0.01 seconds =========================
@@ -169,7 +197,7 @@ now, given this test module::
        f2 = Foo(2)
        assert f1 == f2
 
-you can run the test module and get the custom output defined in 
+you can run the test module and get the custom output defined in
 the conftest file::
 
    $ py.test -q test_foocompare.py
@@ -185,6 +213,7 @@ the conftest file::
    E            vals: 1 != 2
    
    test_foocompare.py:8: AssertionError
+   1 failed in 0.00 seconds
 
 .. _assert-details:
 .. _`assert introspection`:
@@ -198,33 +227,33 @@ Advanced assertion introspection
 Reporting details about a failing assertion is achieved either by rewriting
 assert statements before they are run or re-evaluating the assert expression and
 recording the intermediate values. Which technique is used depends on the
-location of the assert, py.test's configuration, and Python version being used
-to run py.test.  Note that for assert statements with a manually provided
+location of the assert, ``pytest`` configuration, and Python version being used
+to run ``pytest``.  Note that for assert statements with a manually provided
 message, i.e. ``assert expr, message``, no assertion introspection takes place
 and the manually provided message will be rendered in tracebacks.
 
-By default, if the Python version is greater than or equal to 2.6, py.test
+By default, if the Python version is greater than or equal to 2.6, ``pytest``
 rewrites assert statements in test modules. Rewritten assert statements put
-introspection information into the assertion failure message. py.test only
+introspection information into the assertion failure message. ``pytest`` only
 rewrites test modules directly discovered by its test collection process, so
 asserts in supporting modules which are not themselves test modules will not be
 rewritten.
 
 .. note::
 
-   py.test rewrites test modules on import. It does this by using an import hook
-   to write a new pyc files. Most of the time this works transparently. However,
-   if you are messing with import yourself, the import hook may interfere. If
-   this is the case, simply use ``--assert=reinterp`` or
+   ``pytest`` rewrites test modules on import. It does this by using an import
+   hook to write a new pyc files. Most of the time this works transparently.
+   However, if you are messing with import yourself, the import hook may
+   interfere. If this is the case, simply use ``--assert=reinterp`` or
    ``--assert=plain``. Additionally, rewriting will fail silently if it cannot
    write new pycs, i.e. in a read-only filesystem or a zipfile.
 
 If an assert statement has not been rewritten or the Python version is less than
-2.6, py.test falls back on assert reinterpretation. In assert reinterpretation,
-py.test walks the frame of the function containing the assert statement to
-discover sub-expression results of the failing assert statement. You can force
-py.test to always use assertion reinterpretation by passing the
-``--assert=reinterp`` option.
+2.6, ``pytest`` falls back on assert reinterpretation. In assert
+reinterpretation, ``pytest`` walks the frame of the function containing the
+assert statement to discover sub-expression results of the failing assert
+statement. You can force ``pytest`` to always use assertion reinterpretation by
+passing the ``--assert=reinterp`` option.
 
 Assert reinterpretation has a caveat not present with assert rewriting: If
 evaluating the assert expression has side effects you may get a warning that the
@@ -243,7 +272,7 @@ easy to rewrite the assertion and avoid any trouble::
 
 All assert introspection can be turned off by passing ``--assert=plain``.
 
-For further information, Benjamin Peterson wrote up `Behind the scenes of py.test's new assertion rewriting <http://pybites.blogspot.com/2011/07/behind-scenes-of-pytests-new-assertion.html>`_.
+For further information, Benjamin Peterson wrote up `Behind the scenes of pytest's new assertion rewriting <http://pybites.blogspot.com/2011/07/behind-scenes-of-pytests-new-assertion.html>`_.
 
 .. versionadded:: 2.1
    Add assert rewriting as an alternate introspection technique.

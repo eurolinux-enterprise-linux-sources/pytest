@@ -1,15 +1,15 @@
 """ core implementation of testing process: init, session, runtest loop. """
+import re
 
 import py
 import pytest, _pytest
-import inspect
 import os, sys, imp
 try:
     from collections import MutableMapping as MappingMixin
 except ImportError:
     from UserDict import DictMixin as MappingMixin
 
-from _pytest.mark import MarkInfo
+from _pytest.runner import collect_one_node
 
 tracebackcutdir = py.path.local(_pytest.__file__).dirpath()
 
@@ -20,11 +20,11 @@ EXIT_INTERRUPTED = 2
 EXIT_INTERNALERROR = 3
 EXIT_USAGEERROR = 4
 
-name_re = py.std.re.compile("^[a-zA-Z_]\w*$")
+name_re = re.compile("^[a-zA-Z_]\w*$")
 
 def pytest_addoption(parser):
     parser.addini("norecursedirs", "directory patterns to avoid for recursion",
-        type="args", default=('.*', 'CVS', '_darcs', '{arch}'))
+        type="args", default=['.*', 'CVS', '_darcs', '{arch}', '*.egg'])
     #parser.addini("dirpatterns",
     #    "patterns specifying possible locations of test files",
     #    type="linelist", default=["**/test_*.txt",
@@ -35,19 +35,22 @@ def pytest_addoption(parser):
                dest="exitfirst",
                help="exit instantly on first error or failed test."),
     group._addoption('--maxfail', metavar="num",
-               action="store", type="int", dest="maxfail", default=0,
+               action="store", type=int, dest="maxfail", default=0,
                help="exit after first num failures or errors.")
     group._addoption('--strict', action="store_true",
                help="run pytest in strict mode, warnings become errors.")
+    group._addoption("-c", metavar="file", type=str, dest="inifilename",
+               help="load configuration from `file` instead of trying to locate one of the implicit configuration files.")
 
     group = parser.getgroup("collect", "collection")
-    group.addoption('--collectonly',
-        action="store_true", dest="collectonly",
+    group.addoption('--collectonly', '--collect-only', action="store_true",
         help="only collect tests, don't execute them."),
     group.addoption('--pyargs', action="store_true",
         help="try to interpret all arguments as python packages.")
     group.addoption("--ignore", action="append", metavar="path",
         help="ignore path during collection (multi-allowed).")
+    # when changing this to --conf-cut-dir, config.py Conftest.setinitial
+    # needs upgrading as well
     group.addoption('--confcutdir', dest="confcutdir", default=None,
         metavar="dir",
         help="only load conftest.py's relative to specified dir.")
@@ -63,7 +66,7 @@ def pytest_namespace():
     return dict(collect=collect)
 
 def pytest_configure(config):
-    py.test.config = config # compatibiltiy
+    pytest.config = config # compatibiltiy
     if config.option.exitfirst:
         config.option.maxfail = 1
 
@@ -74,14 +77,15 @@ def wrap_session(config, doit):
     initstate = 0
     try:
         try:
-            config.pluginmanager.do_configure(config)
+            config.do_configure()
             initstate = 1
             config.hook.pytest_sessionstart(session=session)
             initstate = 2
             doit(config, session)
         except pytest.UsageError:
-            msg = sys.exc_info()[1].args[0]
-            sys.stderr.write("ERROR: %s\n" %(msg,))
+            args = sys.exc_info()[1].args
+            for msg in args:
+                sys.stderr.write("ERROR: %s\n" %(msg,))
             session.exitstatus = EXIT_USAGEERROR
         except KeyboardInterrupt:
             excinfo = py.code.ExceptionInfo()
@@ -89,7 +93,7 @@ def wrap_session(config, doit):
             session.exitstatus = EXIT_INTERRUPTED
         except:
             excinfo = py.code.ExceptionInfo()
-            config.pluginmanager.notify_exception(excinfo, config.option)
+            config.notify_exception(excinfo, config.option)
             session.exitstatus = EXIT_INTERNALERROR
             if excinfo.errisinstance(SystemExit):
                 sys.stderr.write("mainloop: caught Spurious SystemExit!\n")
@@ -97,12 +101,15 @@ def wrap_session(config, doit):
             if session._testsfailed:
                 session.exitstatus = EXIT_TESTSFAILED
     finally:
+        excinfo = None  # Explicitly break reference cycle.
+        session.startdir.chdir()
         if initstate >= 2:
             config.hook.pytest_sessionfinish(
                 session=session,
                 exitstatus=session.exitstatus)
         if initstate >= 1:
-            config.pluginmanager.do_unconfigure(config)
+            config.do_unconfigure()
+        config.pluginmanager.ensure_shutdown()
     return session.exitstatus
 
 def pytest_cmdline_main(config):
@@ -141,23 +148,22 @@ def pytest_ignore_collect(path, config):
     p = path.dirpath()
     ignore_paths = config._getconftest_pathlist("collect_ignore", path=p)
     ignore_paths = ignore_paths or []
-    excludeopt = config.getvalue("ignore")
+    excludeopt = config.getoption("ignore")
     if excludeopt:
         ignore_paths.extend([py.path.local(x) for x in excludeopt])
     return path in ignore_paths
 
-class HookProxy:
+class FSHookProxy(object):
     def __init__(self, fspath, config):
         self.fspath = fspath
         self.config = config
 
     def __getattr__(self, name):
-        hookmethod = getattr(self.config.hook, name)
+        plugins = self.config._getmatchingplugins(self.fspath)
+        x = self.config.hook._getcaller(name, plugins)
+        self.__dict__[name] = x
+        return x
 
-        def call_matching_hooks(**kwargs):
-            plugins = self.config._getmatchingplugins(self.fspath)
-            return hookmethod.pcall(plugins, **kwargs)
-        return call_matching_hooks
 
 def compatproperty(name):
     def fget(self):
@@ -168,30 +174,39 @@ def compatproperty(name):
 
 class NodeKeywords(MappingMixin):
     def __init__(self, node):
-        parent = node.parent
-        bases = parent and (parent.keywords._markers,) or ()
-        self._markers = type("dynmarker", bases, {node.name: True})
+        self.node = node
+        self.parent = node.parent
+        self._markers = {node.name: True}
 
     def __getitem__(self, key):
         try:
-            return getattr(self._markers, key)
-        except AttributeError:
-            raise KeyError(key)
+            return self._markers[key]
+        except KeyError:
+            if self.parent is None:
+                raise
+            return self.parent.keywords[key]
 
     def __setitem__(self, key, value):
-        setattr(self._markers, key, value)
+        self._markers[key] = value
 
     def __delitem__(self, key):
-        delattr(self._markers, key)
+        raise ValueError("cannot delete key in keywords dict")
 
     def __iter__(self):
-        return iter(self.keys())
+        seen = set(self._markers)
+        if self.parent is not None:
+            seen.update(self.parent.keywords)
+        return iter(seen)
 
     def __len__(self):
-        return len(self.keys())
+        return len(self.__iter__())
 
     def keys(self):
-        return dir(self._markers)
+        return list(self)
+
+    def __repr__(self):
+        return "<NodeKeywords for node %s>" % (self.node, )
+
 
 class Node(object):
     """ base class for Collector and Item the test collection tree.
@@ -215,6 +230,12 @@ class Node(object):
 
         #: keywords/markers collected from all scopes
         self.keywords = NodeKeywords(self)
+
+        #: allow adding of extra keywords to use for matching
+        self.extra_keyword_matches = set()
+
+        # used for storing artificial fixturedefs for direct parametrization
+        self._name2pseudofixturedef = {}
 
         #self.extrainit()
 
@@ -246,6 +267,20 @@ class Node(object):
         return "<%s %r>" %(self.__class__.__name__,
                            getattr(self, 'name', None))
 
+    def warn(self, code, message):
+        """ generate a warning with the given code and message for this
+        item. """
+        assert isinstance(code, str)
+        fslocation = getattr(self, "location", None)
+        if fslocation is None:
+            fslocation = getattr(self, "fspath", None)
+        else:
+            fslocation = "%s:%s" % fslocation[:2]
+
+        self.ihook.pytest_logwarning(code=code, message=message,
+                                     nodeid=self.nodeid,
+                                     fslocation=fslocation)
+
     # methods for ordering nodes
     @property
     def nodeid(self):
@@ -256,21 +291,11 @@ class Node(object):
             self._nodeid = x = self._makeid()
             return x
 
-
     def _makeid(self):
         return self.parent.nodeid + "::" + self.name
 
-    def __eq__(self, other):
-        if not isinstance(other, Node):
-            return False
-        return (self.__class__ == other.__class__ and
-                self.name == other.name and self.parent == other.parent)
-
-    def __ne__(self, other):
-        return not self == other
-
     def __hash__(self):
-        return hash((self.name, self.parent))
+        return hash(self.nodeid)
 
     def setup(self):
         pass
@@ -290,7 +315,7 @@ class Node(object):
         except py.builtin._sysex:
             raise
         except:
-            failure = py.std.sys.exc_info()
+            failure = sys.exc_info()
             setattr(self, exattrname, failure)
             raise
         setattr(self, attrname, res)
@@ -307,13 +332,52 @@ class Node(object):
         chain.reverse()
         return chain
 
+    def add_marker(self, marker):
+        """ dynamically add a marker object to the node.
+
+        ``marker`` can be a string or pytest.mark.* instance.
+        """
+        from _pytest.mark import MarkDecorator
+        if isinstance(marker, py.builtin._basestring):
+            marker = MarkDecorator(marker)
+        elif not isinstance(marker, MarkDecorator):
+            raise ValueError("is not a string or pytest.mark.* Marker")
+        self.keywords[marker.name] = marker
+
+    def get_marker(self, name):
+        """ get a marker object from this node or None if
+        the node doesn't have a marker with that name. """
+        val = self.keywords.get(name, None)
+        if val is not None:
+            from _pytest.mark import MarkInfo, MarkDecorator
+            if isinstance(val, (MarkDecorator, MarkInfo)):
+                return val
+
+    def listextrakeywords(self):
+        """ Return a set of all extra keywords in self and any parents."""
+        extra_keywords = set()
+        item = self
+        for item in self.listchain():
+            extra_keywords.update(item.extra_keyword_matches)
+        return extra_keywords
+
     def listnames(self):
         return [x.name for x in self.listchain()]
 
     def getplugins(self):
         return self.config._getmatchingplugins(self.fspath)
 
+    def addfinalizer(self, fin):
+        """ register a function to be called when this node is finalized.
+
+        This method can only be called when this node is active
+        in a setup chain, for example during self.setup().
+        """
+        self.session._setupstate.addfinalizer(fin, self)
+
     def getparent(self, cls):
+        """ get the next parent node (including ourself)
+        which is an instance of the given class"""
         current = self
         while current and not isinstance(current, cls):
             current = current.parent
@@ -326,20 +390,24 @@ class Node(object):
         fm = self.session._fixturemanager
         if excinfo.errisinstance(fm.FixtureLookupError):
             return excinfo.value.formatrepr()
+        tbfilter = True
         if self.config.option.fulltrace:
             style="long"
         else:
             self._prunetraceback(excinfo)
-        # XXX should excinfo.getrepr record all data and toterminal()
-        # process it?
+            tbfilter = False  # prunetraceback already does it
+            if style == "auto":
+                style = "long"
+        # XXX should excinfo.getrepr record all data and toterminal() process it?
         if style is None:
             if self.config.option.tbstyle == "short":
                 style = "short"
             else:
                 style = "long"
+
         return excinfo.getrepr(funcargs=True,
                                showlocals=self.config.option.showlocals,
-                               style=style)
+                               style=style, tbfilter=tbfilter)
 
     repr_failure = _repr_failure_py
 
@@ -347,6 +415,7 @@ class Collector(Node):
     """ Collector instances create children through collect()
         and thus iteratively build a tree.
     """
+
     class CollectError(Exception):
         """ an error during collection, contains a custom message. """
 
@@ -369,7 +438,6 @@ class Collector(Node):
 
     def _prunetraceback(self, excinfo):
         if hasattr(self, 'fspath'):
-            path = self.fspath
             traceback = excinfo.traceback
             ntraceback = traceback.cut(path=self.fspath)
             if ntraceback == traceback:
@@ -389,9 +457,7 @@ class FSCollector(Collector):
         self.fspath = fspath
 
     def _makeid(self):
-        if self == self.session:
-            return "."
-        relpath = self.session.fspath.bestrelpath(self.fspath)
+        relpath = self.fspath.relto(self.config.rootdir)
         if os.sep != "/":
             relpath = relpath.replace(os.sep, "/")
         return relpath
@@ -404,6 +470,14 @@ class Item(Node):
     there might be multiple test invocation items.
     """
     nextitem = None
+
+    def __init__(self, name, parent=None, config=None, session=None):
+        super(Item, self).__init__(name, parent, config, session)
+        self._report_sections = []
+
+    def add_report_section(self, when, key, content):
+        if content:
+            self._report_sections.append((when, key, content))
 
     def reportinfo(self):
         return self.fspath, None, ""
@@ -434,13 +508,18 @@ class Session(FSCollector):
         __module__ = 'builtins' # for py3
 
     def __init__(self, config):
-        FSCollector.__init__(self, py.path.local(), parent=None,
+        FSCollector.__init__(self, config.rootdir, parent=None,
                              config=config, session=self)
         self.config.pluginmanager.register(self, name="session", prepend=True)
         self._testsfailed = 0
         self.shouldstop = False
         self.trace = config.trace.root.get("collection")
         self._norecursepatterns = config.getini("norecursedirs")
+        self.startdir = py.path.local()
+        self._fs2hookproxy = {}
+
+    def _makeid(self):
+        return ""
 
     def pytest_collectstart(self):
         if self.shouldstop:
@@ -459,7 +538,11 @@ class Session(FSCollector):
         return path in self._initialpaths
 
     def gethookproxy(self, fspath):
-        return HookProxy(fspath, self.config)
+        try:
+            return self._fs2hookproxy[fspath]
+        except KeyError:
+            self._fs2hookproxy[fspath] = x = FSHookProxy(fspath, self.config)
+            return x
 
     def perform_collect(self, args=None, genitems=True):
         hook = self.config.hook
@@ -484,14 +567,16 @@ class Session(FSCollector):
             parts = self._parsearg(arg)
             self._initialparts.append(parts)
             self._initialpaths.add(parts[0])
-        self.ihook.pytest_collectstart(collector=self)
-        rep = self.ihook.pytest_make_collect_report(collector=self)
+        rep = collect_one_node(self)
         self.ihook.pytest_collectreport(report=rep)
         self.trace.root.indent -= 1
         if self._notfound:
+            errors = []
             for arg, exc in self._notfound:
                 line = "(no name %r in any of %r)" % (arg, exc.args[0])
-                raise pytest.UsageError("not found: %s\n%s" %(arg, line))
+                errors.append("not found: %s\n%s" % (arg, line))
+                #XXX: test this
+            raise pytest.UsageError(*errors)
         if not genitems:
             return rep.result
         else:
@@ -512,8 +597,7 @@ class Session(FSCollector):
                 # we are inside a make_report hook so
                 # we cannot directly pass through the exception
                 self._notfound.append((arg, sys.exc_info()[1]))
-                self.trace.root.indent -= 1
-                break
+
             self.trace.root.indent -= 1
 
     def _collect(self, arg):
@@ -580,7 +664,7 @@ class Session(FSCollector):
             arg = self._tryconvertpyarg(arg)
         parts = str(arg).split("::")
         relpath = parts[0].replace("/", os.sep)
-        path = self.fspath.join(relpath, abs=True)
+        path = self.config.invocation_dir.join(relpath, abs=True)
         if not path.check():
             if self.config.option.pyargs:
                 msg = "file or package not found: "
@@ -614,8 +698,7 @@ class Session(FSCollector):
                     resultnodes.append(node)
                 continue
             assert isinstance(node, pytest.Collector)
-            node.ihook.pytest_collectstart(collector=node)
-            rep = node.ihook.pytest_make_collect_report(collector=node)
+            rep = collect_one_node(node)
             if rep.passed:
                 has_matched = False
                 for x in rep.result:
@@ -636,19 +719,11 @@ class Session(FSCollector):
             yield node
         else:
             assert isinstance(node, pytest.Collector)
-            node.ihook.pytest_collectstart(collector=node)
-            rep = node.ihook.pytest_make_collect_report(collector=node)
+            rep = collect_one_node(node)
             if rep.passed:
                 for subnode in rep.result:
                     for x in self.genitems(subnode):
                         yield x
             node.ihook.pytest_collectreport(report=rep)
 
-def getfslineno(obj):
-    # xxx let decorators etc specify a sane ordering
-    if hasattr(obj, 'place_as'):
-        obj = obj.place_as
-    fslineno = py.code.getfslineno(obj)
-    assert isinstance(fslineno[1], int), obj
-    return fslineno
 

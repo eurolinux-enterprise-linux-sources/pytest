@@ -2,28 +2,19 @@
 
 Based on initial code from Ross Lawley.
 """
-
 import py
 import os
 import re
 import sys
 import time
 
-
 # Python 2.X and 3.X compatibility
-try:
-    unichr(65)
-except NameError:
+if sys.version_info[0] < 3:
+    from codecs import open
+else:
     unichr = chr
-try:
-    unicode('A')
-except NameError:
     unicode = str
-try:
-    long(1)
-except NameError:
     long = int
-
 
 class Junit(py.xml.Namespace):
     pass
@@ -36,7 +27,8 @@ class Junit(py.xml.Namespace):
 #                    | [#x10000-#x10FFFF]
 _legal_chars = (0x09, 0x0A, 0x0d)
 _legal_ranges = (
-    (0x20, 0xD7FF),
+    (0x20, 0x7E),
+    (0x80, 0xD7FF),
     (0xE000, 0xFFFD),
     (0x10000, 0x10FFFF),
 )
@@ -61,10 +53,10 @@ def bin_xml_escape(arg):
 
 def pytest_addoption(parser):
     group = parser.getgroup("terminal reporting")
-    group.addoption('--junitxml', action="store", dest="xmlpath",
-           metavar="path", default=None,
+    group.addoption('--junitxml', '--junit-xml', action="store",
+           dest="xmlpath", metavar="path", default=None,
            help="create junit-xml style report file at given path.")
-    group.addoption('--junitprefix', action="store", dest="junitprefix",
+    group.addoption('--junitprefix', '--junit-prefix', action="store",
            metavar="str", default=None,
            help="prepend prefix to classnames in junit-xml output")
 
@@ -103,17 +95,19 @@ class LogXML(object):
             classnames.insert(0, self.prefix)
         self.tests.append(Junit.testcase(
             classname=".".join(classnames),
-            name=names[-1],
+            name=bin_xml_escape(names[-1]),
             time=getattr(report, 'duration', 0)
         ))
 
     def _write_captured_output(self, report):
-        sec = dict(report.sections)
-        for name in ('out', 'err'):
-            content = sec.get("Captured std%s" % name)
-            if content:
-                tag = getattr(Junit, 'system-'+name)
-                self.append(tag(bin_xml_escape(content)))
+        for capname in ('out', 'err'):
+            allcontent = ""
+            for name, content in report.get_sections("Captured std%s" %
+                                                    capname):
+                allcontent += content
+            if allcontent:
+                tag = getattr(Junit, 'system-'+capname)
+                self.append(tag(bin_xml_escape(allcontent)))
 
     def append(self, obj):
         self.tests[-1].append(obj)
@@ -129,39 +123,44 @@ class LogXML(object):
                 Junit.skipped(message="xfail-marked test passes unexpectedly"))
             self.skipped += 1
         else:
-            fail = Junit.failure(message="test failure")
-            fail.append(str(report.longrepr))
+            if isinstance(report.longrepr, (unicode, str)):
+                message = report.longrepr
+            else:
+                message = report.longrepr.reprcrash.message
+            message = bin_xml_escape(message)
+            fail = Junit.failure(message=message)
+            fail.append(bin_xml_escape(report.longrepr))
             self.append(fail)
             self.failed += 1
         self._write_captured_output(report)
 
-    def append_collect_failure(self, report):
+    def append_collect_error(self, report):
         #msg = str(report.longrepr.reprtraceback.extraline)
-        self.append(Junit.failure(str(report.longrepr),
-                                  message="collection failure"))
+        self.append(Junit.error(bin_xml_escape(report.longrepr),
+                                message="collection failure"))
         self.errors += 1
 
     def append_collect_skipped(self, report):
         #msg = str(report.longrepr.reprtraceback.extraline)
-        self.append(Junit.skipped(str(report.longrepr),
+        self.append(Junit.skipped(bin_xml_escape(report.longrepr),
                                   message="collection skipped"))
         self.skipped += 1
 
     def append_error(self, report):
-        self.append(Junit.error(str(report.longrepr),
+        self.append(Junit.error(bin_xml_escape(report.longrepr),
                                 message="test setup failure"))
         self.errors += 1
 
     def append_skipped(self, report):
         if hasattr(report, "wasxfail"):
-            self.append(Junit.skipped(str(report.wasxfail),
+            self.append(Junit.skipped(bin_xml_escape(report.wasxfail),
                                       message="expected test failure"))
         else:
             filename, lineno, skipreason = report.longrepr
             if skipreason.startswith("Skipped: "):
-                skipreason = skipreason[9:]
+                skipreason = bin_xml_escape(skipreason[9:])
             self.append(
-                Junit.skipped("%s:%s: %s" % report.longrepr,
+                Junit.skipped("%s:%s: %s" % (filename, lineno, skipreason),
                               type="pytest.skip",
                               message=skipreason
                 ))
@@ -187,28 +186,24 @@ class LogXML(object):
         if not report.passed:
             self._opentestcase(report)
             if report.failed:
-                self.append_collect_failure(report)
+                self.append_collect_error(report)
             else:
                 self.append_collect_skipped(report)
 
     def pytest_internalerror(self, excrepr):
         self.errors += 1
-        data = py.xml.escape(excrepr)
+        data = bin_xml_escape(excrepr)
         self.tests.append(
             Junit.testcase(
                     Junit.error(data, message="internal error"),
                     classname="pytest",
                     name="internal"))
 
-    def pytest_sessionstart(self, session):
+    def pytest_sessionstart(self):
         self.suite_start_time = time.time()
 
-    def pytest_sessionfinish(self, session, exitstatus, __multicall__):
-        if py.std.sys.version_info[0] < 3:
-            logfile = py.std.codecs.open(self.logfile, 'w', encoding='utf-8')
-        else:
-            logfile = open(self.logfile, 'w', encoding='utf-8')
-
+    def pytest_sessionfinish(self):
+        logfile = open(self.logfile, 'w', encoding='utf-8')
         suite_stop_time = time.time()
         suite_time_delta = suite_stop_time - self.suite_start_time
         numtests = self.passed + self.failed
@@ -216,7 +211,7 @@ class LogXML(object):
         logfile.write('<?xml version="1.0" encoding="utf-8"?>')
         logfile.write(Junit.testsuite(
             self.tests,
-            name="",
+            name="pytest",
             errors=self.errors,
             failures=self.failed,
             skips=self.skipped,

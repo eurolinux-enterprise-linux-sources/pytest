@@ -1,19 +1,18 @@
 import pytest, py, os
-from _pytest.core import PluginManager
-from _pytest.core import MultiCall, HookRelay, varnames
+from _pytest.core import * # noqa
+from _pytest.config import get_plugin_manager
 
 
 class TestBootstrapping:
     def test_consider_env_fails_to_import(self, monkeypatch):
         pluginmanager = PluginManager()
         monkeypatch.setenv('PYTEST_PLUGINS', 'nonexisting', prepend=",")
-        pytest.raises(ImportError, "pluginmanager.consider_env()")
+        pytest.raises(ImportError, lambda: pluginmanager.consider_env())
 
     def test_preparse_args(self):
         pluginmanager = PluginManager()
-        pytest.raises(ImportError, """
-            pluginmanager.consider_preparse(["xyz", "-p", "hello123"])
-        """)
+        pytest.raises(ImportError, lambda:
+            pluginmanager.consider_preparse(["xyz", "-p", "hello123"]))
 
     def test_plugin_prevent_register(self):
         pluginmanager = PluginManager()
@@ -44,11 +43,11 @@ class TestBootstrapping:
         """)
         p.copy(p.dirpath("skipping2.py"))
         monkeypatch.setenv("PYTEST_PLUGINS", "skipping2")
-        result = testdir.runpytest("-p", "skipping1", "--traceconfig")
+        result = testdir.runpytest("-rw", "-p", "skipping1", "--traceconfig")
         assert result.ret == 0
         result.stdout.fnmatch_lines([
-            "*hint*skipping1*hello*",
-            "*hint*skipping2*hello*",
+            "WI1*skipped plugin*skipping1*hello*",
+            "WI1*skipped plugin*skipping2*hello*",
         ])
 
     def test_consider_env_plugin_instantiation(self, testdir, monkeypatch):
@@ -66,7 +65,7 @@ class TestBootstrapping:
         assert l2 == l3
 
     def test_consider_setuptools_instantiation(self, monkeypatch):
-        pkg_resources = py.test.importorskip("pkg_resources")
+        pkg_resources = pytest.importorskip("pkg_resources")
         def my_iter(name):
             assert name == "pytest11"
             class EntryPoint:
@@ -92,7 +91,7 @@ class TestBootstrapping:
         # ok, we did not explode
 
     def test_pluginmanager_ENV_startup(self, testdir, monkeypatch):
-        x500 = testdir.makepyfile(pytest_x500="#")
+        testdir.makepyfile(pytest_x500="#")
         p = testdir.makepyfile("""
             import pytest
             def test_hello(pytestconfig):
@@ -109,7 +108,7 @@ class TestBootstrapping:
         pytest.raises(ImportError, 'pluginmanager.import_plugin("qweqwex.y")')
         pytest.raises(ImportError, 'pluginmanager.import_plugin("pytest_qweqwx.y")')
 
-        reset = testdir.syspathinsert()
+        testdir.syspathinsert()
         pluginname = "pytest_hello"
         testdir.makepyfile(**{pluginname: ""})
         pluginmanager.import_plugin("pytest_hello")
@@ -127,7 +126,7 @@ class TestBootstrapping:
         pytest.raises(ImportError, 'pluginmanager.import_plugin("qweqwex.y")')
         pytest.raises(ImportError, 'pluginmanager.import_plugin("pytest_qweqwex.y")')
 
-        reset = testdir.syspathinsert()
+        testdir.syspathinsert()
         testdir.mkpydir("pkg").join("plug.py").write("x=3")
         pluginname = "pkg.plug"
         pluginmanager.import_plugin(pluginname)
@@ -149,8 +148,8 @@ class TestBootstrapping:
         mod = py.std.types.ModuleType("x")
         mod.pytest_plugins = "pytest_a"
         aplugin = testdir.makepyfile(pytest_a="#")
-        pluginmanager = PluginManager()
-        reprec = testdir.getreportrecorder(pluginmanager)
+        pluginmanager = get_plugin_manager()
+        reprec = testdir.make_hook_recorder(pluginmanager)
         #syspath.prepend(aplugin.dirpath())
         py.std.sys.path.insert(0, str(aplugin.dirpath()))
         pluginmanager.consider_module(mod)
@@ -169,7 +168,7 @@ class TestBootstrapping:
     def test_consider_conftest_deps(self, testdir):
         mod = testdir.makepyfile("pytest_plugins='xyz'").pyimport()
         pp = PluginManager()
-        pytest.raises(ImportError, "pp.consider_conftest(mod)")
+        pytest.raises(ImportError, lambda: pp.consider_conftest(mod))
 
     def test_pm(self):
         pp = PluginManager()
@@ -185,8 +184,6 @@ class TestBootstrapping:
         assert pp.getplugin('hello') == a2
         pp.unregister(a1)
         assert not pp.isregistered(a1)
-        pp.unregister(name="hello")
-        assert not pp.isregistered(a2)
 
     def test_pm_ordering(self):
         pp = PluginManager()
@@ -209,9 +206,7 @@ class TestBootstrapping:
         l = pp.getplugins()
         assert mod in l
         pytest.raises(ValueError, "pp.register(mod)")
-        mod2 = py.std.types.ModuleType("pytest_hello")
-        #pp.register(mod2) # double pm
-        pytest.raises(ValueError, "pp.register(mod)")
+        pytest.raises(ValueError, lambda: pp.register(mod))
         #assert not pp.isregistered(mod2)
         assert pp.getplugins() == l
 
@@ -224,36 +219,21 @@ class TestBootstrapping:
         assert pp.isregistered(mod)
 
     def test_register_mismatch_method(self):
-        pp = PluginManager(load=True)
+        pp = get_plugin_manager()
         class hello:
             def pytest_gurgel(self):
                 pass
-        pytest.raises(Exception, "pp.register(hello())")
+        pytest.raises(Exception, lambda: pp.register(hello()))
 
     def test_register_mismatch_arg(self):
-        pp = PluginManager(load=True)
+        pp = get_plugin_manager()
         class hello:
             def pytest_configure(self, asd):
                 pass
-        excinfo = pytest.raises(Exception, "pp.register(hello())")
-
-
-    def test_notify_exception(self, capfd):
-        pp = PluginManager()
-        excinfo = pytest.raises(ValueError, "raise ValueError(1)")
-        pp.notify_exception(excinfo)
-        out, err = capfd.readouterr()
-        assert "ValueError" in err
-        class A:
-            def pytest_internalerror(self, excrepr):
-                return True
-        pp.register(A())
-        pp.notify_exception(excinfo)
-        out, err = capfd.readouterr()
-        assert not err
+        pytest.raises(Exception, lambda: pp.register(hello()))
 
     def test_register(self):
-        pm = PluginManager(load=False)
+        pm = get_plugin_manager()
         class MyPlugin:
             pass
         my = MyPlugin()
@@ -261,13 +241,13 @@ class TestBootstrapping:
         assert pm.getplugins()
         my2 = MyPlugin()
         pm.register(my2)
-        assert pm.getplugins()[1:] == [my, my2]
+        assert pm.getplugins()[-2:] == [my, my2]
 
         assert pm.isregistered(my)
         assert pm.isregistered(my2)
         pm.unregister(my)
         assert not pm.isregistered(my)
-        assert pm.getplugins()[1:] == [my2]
+        assert pm.getplugins()[-1:] == [my2]
 
     def test_listattr(self):
         plugins = PluginManager()
@@ -284,7 +264,7 @@ class TestBootstrapping:
         assert l == [41, 42, 43]
 
     def test_hook_tracing(self):
-        pm = PluginManager()
+        pm = get_plugin_manager()
         saveindent = []
         class api1:
             x = 41
@@ -292,14 +272,15 @@ class TestBootstrapping:
                 saveindent.append(pm.trace.root.indent)
                 raise ValueError(42)
         l = []
-        pm.trace.root.setwriter(l.append)
+        pm.set_tracing(l.append)
         indent = pm.trace.root.indent
         p = api1()
         pm.register(p)
 
         assert pm.trace.root.indent == indent
-        assert len(l) == 1
+        assert len(l) == 2
         assert 'pytest_plugin_registered' in l[0]
+        assert 'finish' in l[1]
         pytest.raises(ValueError, lambda: pm.register(api1()))
         assert pm.trace.root.indent == indent
         assert saveindent[0] > indent
@@ -307,7 +288,7 @@ class TestBootstrapping:
 class TestPytestPluginInteractions:
 
     def test_addhooks_conftestplugin(self, testdir):
-        newhooks = testdir.makepyfile(newhooks="""
+        testdir.makepyfile(newhooks="""
             def pytest_myhook(xyz):
                 "new hook"
         """)
@@ -319,14 +300,14 @@ class TestPytestPluginInteractions:
             def pytest_myhook(xyz):
                 return xyz + 1
         """)
-        config = testdir.Config()
+        config = get_plugin_manager().config
         config._conftest.importconftest(conf)
         print(config.pluginmanager.getplugins())
         res = config.hook.pytest_myhook(xyz=10)
         assert res == [11]
 
     def test_addhooks_nohooks(self, testdir):
-        conf = testdir.makeconftest("""
+        testdir.makeconftest("""
             import sys
             def pytest_addhooks(pluginmanager):
                 pluginmanager.addhooks(sys)
@@ -352,16 +333,14 @@ class TestPytestPluginInteractions:
                 return {'hello': 'world'}
         """)
         p = testdir.makepyfile("""
-            from py.test import hello
-            import py
+            from pytest import hello
+            import pytest
             def test_hello():
                 assert hello == "world"
-                assert 'hello' in py.test.__all__
+                assert 'hello' in pytest.__all__
         """)
-        result = testdir.runpytest(p)
-        result.stdout.fnmatch_lines([
-            "*1 passed*"
-        ])
+        reprec = testdir.inline_run(p)
+        reprec.assertoutcome(passed=1)
 
     def test_do_option_postinitialize(self, testdir):
         config = testdir.parseconfigure()
@@ -383,13 +362,13 @@ class TestPytestPluginInteractions:
 
         config.pluginmanager.register(A())
         assert len(l) == 0
-        config.pluginmanager.do_configure(config=config)
+        config.do_configure()
         assert len(l) == 1
         config.pluginmanager.register(A())  # leads to a configured() plugin
         assert len(l) == 2
         assert l[0] != l[1]
 
-        config.pluginmanager.do_unconfigure(config=config)
+        config.do_unconfigure()
         config.pluginmanager.register(A())
         assert len(l) == 2
 
@@ -425,11 +404,7 @@ class TestPytestPluginInteractions:
         pluginmanager.register(p3)
         methods = pluginmanager.listattr('m')
         assert methods == [p2.m, p3.m, p1.m]
-        # listattr keeps a cache and deleting
-        # a function attribute requires clearing it
-        pluginmanager._listattrcache.clear()
         del P1.m.__dict__['tryfirst']
-
         pytest.mark.trylast(getattr(P2.m, 'im_func', P2.m))
         methods = pluginmanager.listattr('m')
         assert methods == [p2.m, p1.m, p3.m]
@@ -445,7 +420,7 @@ def test_namespace_has_default_and_env_plugins(testdir):
 
 def test_varnames():
     def f(x):
-        i = 3
+        i = 3  # noqa
     class A:
         def f(self, y):
             pass
@@ -455,6 +430,20 @@ def test_varnames():
     assert varnames(f) == ("x",)
     assert varnames(A().f) == ('y',)
     assert varnames(B()) == ('z',)
+
+def test_varnames_default():
+    def f(x, y=3):
+        pass
+    assert varnames(f) == ("x",)
+
+def test_varnames_class():
+    class C:
+        def __init__(self, x):
+            pass
+    class D:
+        pass
+    assert varnames(C) == ("x",)
+    assert varnames(D) == ()
 
 class TestMultiCall:
     def test_uses_copy_of_methods(self):
@@ -505,12 +494,10 @@ class TestMultiCall:
             return x + z
         reslist = MultiCall([f], dict(x=23, y=24)).execute()
         assert reslist == [24]
-        reslist = MultiCall([f], dict(x=23, z=2)).execute()
-        assert reslist == [25]
 
     def test_tags_call_error(self):
         multicall = MultiCall([lambda x: x], {})
-        pytest.raises(TypeError, "multicall.execute()")
+        pytest.raises(KeyError, multicall.execute)
 
     def test_call_subexecute(self):
         def m(__multicall__):
@@ -534,23 +521,124 @@ class TestMultiCall:
         res = MultiCall([m1, m2], {}).execute()
         assert res == [1]
 
+    def test_hookwrapper(self):
+        l = []
+        def m1():
+            l.append("m1 init")
+            yield None
+            l.append("m1 finish")
+        m1.hookwrapper = True
+
+        def m2():
+            l.append("m2")
+            return 2
+        res = MultiCall([m2, m1], {}).execute()
+        assert res == [2]
+        assert l == ["m1 init", "m2", "m1 finish"]
+        l[:] = []
+        res = MultiCall([m2, m1], {}, firstresult=True).execute()
+        assert res == 2
+        assert l == ["m1 init", "m2", "m1 finish"]
+
+    def test_hookwrapper_order(self):
+        l = []
+        def m1():
+            l.append("m1 init")
+            yield 1
+            l.append("m1 finish")
+        m1.hookwrapper = True
+
+        def m2():
+            l.append("m2 init")
+            yield 2
+            l.append("m2 finish")
+        m2.hookwrapper = True
+        res = MultiCall([m2, m1], {}).execute()
+        assert res == []
+        assert l == ["m1 init", "m2 init", "m2 finish", "m1 finish"]
+
+    def test_listattr_hookwrapper_ordering(self):
+        class P1:
+            @pytest.mark.hookwrapper
+            def m(self):
+                return 17
+
+        class P2:
+            def m(self):
+                return 23
+
+        class P3:
+            @pytest.mark.tryfirst
+            def m(self):
+                return 19
+
+        pluginmanager = PluginManager()
+        p1 = P1()
+        p2 = P2()
+        p3 = P3()
+        pluginmanager.register(p1)
+        pluginmanager.register(p2)
+        pluginmanager.register(p3)
+        methods = pluginmanager.listattr('m')
+        assert methods == [p2.m, p3.m, p1.m]
+        ## listattr keeps a cache and deleting
+        ## a function attribute requires clearing it
+        #pluginmanager._listattrcache.clear()
+        #del P1.m.__dict__['tryfirst']
+
+    def test_hookwrapper_not_yield(self):
+        def m1():
+            pass
+        m1.hookwrapper = True
+
+        mc = MultiCall([m1], {})
+        with pytest.raises(TypeError):
+            mc.execute()
+
+    def test_hookwrapper_too_many_yield(self):
+        def m1():
+            yield 1
+            yield 2
+        m1.hookwrapper = True
+
+        mc = MultiCall([m1], {})
+        with pytest.raises(RuntimeError) as ex:
+            mc.execute()
+        assert "m1" in str(ex.value)
+        assert "test_core.py:" in str(ex.value)
+
+
 class TestHookRelay:
     def test_happypath(self):
-        pm = PluginManager()
         class Api:
             def hello(self, arg):
                 "api hook 1"
-
-        mcm = HookRelay(hookspecs=Api, pm=pm, prefix="he")
-        assert hasattr(mcm, 'hello')
-        assert repr(mcm.hello).find("hello") != -1
+        pm = PluginManager([Api], prefix="he")
+        hook = pm.hook
+        assert hasattr(hook, 'hello')
+        assert repr(hook.hello).find("hello") != -1
         class Plugin:
             def hello(self, arg):
                 return arg + 1
-        pm.register(Plugin())
-        l = mcm.hello(arg=3)
+        plugin = Plugin()
+        pm.register(plugin)
+        l = hook.hello(arg=3)
         assert l == [4]
-        assert not hasattr(mcm, 'world')
+        assert not hasattr(hook, 'world')
+        pm.unregister(plugin)
+        assert hook.hello(arg=3) == []
+
+    def test_argmismatch(self):
+        class Api:
+            def hello(self, arg):
+                "api hook 1"
+        pm = PluginManager(Api, prefix="he")
+        class Plugin:
+            def hello(self, argwrong):
+                return arg + 1
+        with pytest.raises(PluginValidationError) as exc:
+            pm.register(Plugin())
+        assert "argwrong" in str(exc.value)
 
     def test_only_kwargs(self):
         pm = PluginManager()
@@ -558,21 +646,19 @@ class TestHookRelay:
             def hello(self, arg):
                 "api hook 1"
         mcm = HookRelay(hookspecs=Api, pm=pm, prefix="he")
-        pytest.raises(TypeError, "mcm.hello(3)")
+        pytest.raises(TypeError, lambda: mcm.hello(3))
 
     def test_firstresult_definition(self):
-        pm = PluginManager()
         class Api:
             def hello(self, arg):
                 "api hook 1"
             hello.firstresult = True
-
-        mcm = HookRelay(hookspecs=Api, pm=pm, prefix="he")
+        pm = PluginManager([Api], "he")
         class Plugin:
             def hello(self, arg):
                 return arg + 1
         pm.register(Plugin())
-        res = mcm.hello(arg=3)
+        res = pm.hook.hello(arg=3)
         assert res == 4
 
 class TestTracer:
@@ -669,3 +755,112 @@ def test_default_markers(testdir):
         "*tryfirst*first*",
         "*trylast*last*",
     ])
+
+def test_importplugin_issue375(testdir):
+    testdir.makepyfile(qwe="import aaaa")
+    excinfo = pytest.raises(ImportError, lambda: importplugin("qwe"))
+    assert "qwe" not in str(excinfo.value)
+    assert "aaaa" in str(excinfo.value)
+
+class TestWrapMethod:
+    def test_basic_happypath(self):
+        class A:
+            def f(self):
+                return "A.f"
+
+        l = []
+        def f(self):
+            l.append(1)
+            box = yield
+            assert box.result == "A.f"
+            l.append(2)
+        undo = add_method_wrapper(A, f)
+
+        assert A().f() == "A.f"
+        assert l == [1,2]
+        undo()
+        l[:] = []
+        assert A().f() == "A.f"
+        assert l == []
+
+    def test_no_yield(self):
+        class A:
+            def method(self):
+                return
+
+        def method(self):
+            if 0:
+                yield
+
+        add_method_wrapper(A, method)
+        with pytest.raises(RuntimeError) as excinfo:
+            A().method()
+
+        assert "method" in str(excinfo.value)
+        assert "did not yield" in str(excinfo.value)
+
+    def test_method_raises(self):
+        class A:
+            def error(self, val):
+                raise ValueError(val)
+
+        l = []
+        def error(self, val):
+            l.append(val)
+            yield
+            l.append(None)
+
+        undo = add_method_wrapper(A, error)
+
+        with pytest.raises(ValueError):
+            A().error(42)
+        assert l == [42, None]
+        undo()
+        l[:] = []
+        with pytest.raises(ValueError):
+            A().error(42)
+        assert l == []
+
+    def test_controller_swallows_method_raises(self):
+        class A:
+            def error(self, val):
+                raise ValueError(val)
+
+        def error(self, val):
+            box = yield
+            box.force_result(2)
+
+        add_method_wrapper(A, error)
+        assert A().error(42) == 2
+
+    def test_reraise_on_controller_StopIteration(self):
+        class A:
+            def error(self, val):
+                raise ValueError(val)
+
+        def error(self, val):
+            try:
+                yield
+            except ValueError:
+                pass
+
+        add_method_wrapper(A, error)
+        with pytest.raises(ValueError):
+            A().error(42)
+
+    @pytest.mark.xfail(reason="if needed later")
+    def test_modify_call_args(self):
+        class A:
+            def error(self, val1, val2):
+                raise ValueError(val1+val2)
+
+        l = []
+        def error(self):
+            box = yield (1,), {'val2': 2}
+            assert box.excinfo[1].args == (3,)
+            l.append(1)
+
+        add_method_wrapper(A, error)
+        with pytest.raises(ValueError):
+            A().error()
+        assert l == [1]

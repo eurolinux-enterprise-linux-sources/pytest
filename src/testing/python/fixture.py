@@ -1,6 +1,8 @@
 import pytest, py, sys
 from _pytest import python as funcargs
 from _pytest.python import FixtureLookupError
+from _pytest.pytester import get_public_names
+from textwrap import dedent
 
 def test_getfuncargnames():
     def f(): pass
@@ -31,7 +33,7 @@ class TestFillFixtures:
             def test_func(some):
                 pass
         """)
-        result = testdir.runpytest() # "--collectonly")
+        result = testdir.runpytest() # "--collect-only")
         assert result.ret != 0
         result.stdout.fnmatch_lines([
             "*def test_func(some)*",
@@ -50,7 +52,7 @@ class TestFillFixtures:
         """)
         funcargs.fillfixtures(item)
         del item.funcargs["request"]
-        assert len(item.funcargs) == 2
+        assert len(get_public_names(item.funcargs)) == 2
         assert item.funcargs['some'] == "test_func"
         assert item.funcargs['other'] == 42
 
@@ -102,8 +104,258 @@ class TestFillFixtures:
             "*2 passed*"
         ])
 
+    def test_extend_fixture_module_class(self, testdir):
+        testfile = testdir.makepyfile("""
+            import pytest
+
+            @pytest.fixture
+            def spam():
+                return 'spam'
+
+            class TestSpam:
+
+                 @pytest.fixture
+                 def spam(self, spam):
+                     return spam * 2
+
+                 def test_spam(self, spam):
+                     assert spam == 'spamspam'
+        """)
+        result = testdir.runpytest()
+        result.stdout.fnmatch_lines(["*1 passed*"])
+        result = testdir.runpytest(testfile)
+        result.stdout.fnmatch_lines(["*1 passed*"])
+
+    def test_extend_fixture_conftest_module(self, testdir):
+        testdir.makeconftest("""
+            import pytest
+
+            @pytest.fixture
+            def spam():
+                return 'spam'
+        """)
+        testfile = testdir.makepyfile("""
+            import pytest
+
+            @pytest.fixture
+            def spam(spam):
+                return spam * 2
+
+            def test_spam(spam):
+                assert spam == 'spamspam'
+        """)
+        result = testdir.runpytest()
+        result.stdout.fnmatch_lines(["*1 passed*"])
+        result = testdir.runpytest(testfile)
+        result.stdout.fnmatch_lines(["*1 passed*"])
+
+    def test_extend_fixture_conftest_conftest(self, testdir):
+        testdir.makeconftest("""
+            import pytest
+
+            @pytest.fixture
+            def spam():
+                return 'spam'
+        """)
+        pkg = testdir.mkpydir("pkg")
+        pkg.join("conftest.py").write(py.code.Source("""
+            import pytest
+
+            @pytest.fixture
+            def spam(spam):
+                return spam * 2
+        """))
+        testfile = pkg.join("test_spam.py")
+        testfile.write(py.code.Source("""
+            def test_spam(spam):
+                assert spam == "spamspam"
+        """))
+        result = testdir.runpytest()
+        result.stdout.fnmatch_lines(["*1 passed*"])
+        result = testdir.runpytest(testfile)
+        result.stdout.fnmatch_lines(["*1 passed*"])
+
+    def test_extend_fixture_conftest_plugin(self, testdir):
+        testdir.makepyfile(testplugin="""
+            import pytest
+
+            @pytest.fixture
+            def foo():
+                return 7
+        """)
+        testdir.syspathinsert()
+        testdir.makeconftest("""
+            import pytest
+
+            pytest_plugins = 'testplugin'
+
+            @pytest.fixture
+            def foo(foo):
+                return foo + 7
+        """)
+        testdir.makepyfile("""
+            def test_foo(foo):
+                assert foo == 14
+        """)
+        result = testdir.runpytest('-s')
+        assert result.ret == 0
+
+    def test_extend_fixture_plugin_plugin(self, testdir):
+        # Two plugins should extend each order in loading order
+        testdir.makepyfile(testplugin0="""
+            import pytest
+
+            @pytest.fixture
+            def foo():
+                return 7
+        """)
+        testdir.makepyfile(testplugin1="""
+            import pytest
+
+            @pytest.fixture
+            def foo(foo):
+                return foo + 7
+        """)
+        testdir.syspathinsert()
+        testdir.makepyfile("""
+            pytest_plugins = ['testplugin0', 'testplugin1']
+
+            def test_foo(foo):
+                assert foo == 14
+        """)
+        result = testdir.runpytest()
+        assert result.ret == 0
+
+    def test_override_parametrized_fixture_conftest_module(self, testdir):
+        """Test override of the parametrized fixture with non-parametrized one on the test module level."""
+        testdir.makeconftest("""
+            import pytest
+
+            @pytest.fixture(params=[1, 2, 3])
+            def spam(request):
+                return request.param
+        """)
+        testfile = testdir.makepyfile("""
+            import pytest
+
+            @pytest.fixture
+            def spam():
+                return 'spam'
+
+            def test_spam(spam):
+                assert spam == 'spam'
+        """)
+        result = testdir.runpytest()
+        result.stdout.fnmatch_lines(["*1 passed*"])
+        result = testdir.runpytest(testfile)
+        result.stdout.fnmatch_lines(["*1 passed*"])
+
+    def test_override_parametrized_fixture_conftest_conftest(self, testdir):
+        """Test override of the parametrized fixture with non-parametrized one on the conftest level."""
+        testdir.makeconftest("""
+            import pytest
+
+            @pytest.fixture(params=[1, 2, 3])
+            def spam(request):
+                return request.param
+        """)
+        subdir = testdir.mkpydir('subdir')
+        subdir.join("conftest.py").write(py.code.Source("""
+            import pytest
+
+            @pytest.fixture
+            def spam():
+                return 'spam'
+        """))
+        testfile = subdir.join("test_spam.py")
+        testfile.write(py.code.Source("""
+            def test_spam(spam):
+                assert spam == "spam"
+        """))
+        result = testdir.runpytest()
+        result.stdout.fnmatch_lines(["*1 passed*"])
+        result = testdir.runpytest(testfile)
+        result.stdout.fnmatch_lines(["*1 passed*"])
+
+    def test_override_non_parametrized_fixture_conftest_module(self, testdir):
+        """Test override of the non-parametrized fixture with parametrized one on the test module level."""
+        testdir.makeconftest("""
+            import pytest
+
+            @pytest.fixture
+            def spam():
+                return 'spam'
+        """)
+        testfile = testdir.makepyfile("""
+            import pytest
+
+            @pytest.fixture(params=[1, 2, 3])
+            def spam(request):
+                return request.param
+
+            params = {'spam': 1}
+
+            def test_spam(spam):
+                assert spam == params['spam']
+                params['spam'] += 1
+        """)
+        result = testdir.runpytest()
+        result.stdout.fnmatch_lines(["*3 passed*"])
+        result = testdir.runpytest(testfile)
+        result.stdout.fnmatch_lines(["*3 passed*"])
+
+    def test_override_non_parametrized_fixture_conftest_conftest(self, testdir):
+        """Test override of the non-parametrized fixture with parametrized one on the conftest level."""
+        testdir.makeconftest("""
+            import pytest
+
+            @pytest.fixture
+            def spam():
+                return 'spam'
+        """)
+        subdir = testdir.mkpydir('subdir')
+        subdir.join("conftest.py").write(py.code.Source("""
+            import pytest
+
+            @pytest.fixture(params=[1, 2, 3])
+            def spam(request):
+                return request.param
+        """))
+        testfile = subdir.join("test_spam.py")
+        testfile.write(py.code.Source("""
+            params = {'spam': 1}
+
+            def test_spam(spam):
+                assert spam == params['spam']
+                params['spam'] += 1
+        """))
+        result = testdir.runpytest()
+        result.stdout.fnmatch_lines(["*3 passed*"])
+        result = testdir.runpytest(testfile)
+        result.stdout.fnmatch_lines(["*3 passed*"])
+
+    def test_autouse_fixture_plugin(self, testdir):
+        # A fixture from a plugin has no baseid set, which screwed up
+        # the autouse fixture handling.
+        testdir.makepyfile(testplugin="""
+            import pytest
+
+            @pytest.fixture(autouse=True)
+            def foo(request):
+                request.function.foo = 7
+        """)
+        testdir.syspathinsert()
+        testdir.makepyfile("""
+            pytest_plugins = 'testplugin'
+
+            def test_foo(request):
+                assert request.function.foo == 7
+        """)
+        result = testdir.runpytest()
+        assert result.ret == 0
+
     def test_funcarg_lookup_error(self, testdir):
-        p = testdir.makepyfile("""
+        testdir.makepyfile("""
             def test_lookup_error(unknown):
                 pass
         """)
@@ -116,6 +368,29 @@ class TestFillFixtures:
             "*1 error*",
         ])
         assert "INTERNAL" not in result.stdout.str()
+
+    def test_fixture_excinfo_leak(self, testdir):
+        # on python2 sys.excinfo would leak into fixture executions
+        testdir.makepyfile("""
+            import sys
+            import traceback
+            import pytest
+
+            @pytest.fixture
+            def leak():
+                if sys.exc_info()[0]:  # python3 bug :)
+                    traceback.print_exc()
+                #fails
+                assert sys.exc_info() == (None, None, None)
+
+            def test_leak(leak):
+                if sys.exc_info()[0]:  # python3 bug :)
+                    traceback.print_exc()
+                assert sys.exc_info() == (None, None, None)
+        """)
+        result = testdir.runpytest()
+        assert result.ret == 0
+
 
 class TestRequestBasic:
     def test_request_attributes(self, testdir):
@@ -163,7 +438,7 @@ class TestRequestBasic:
             def pytest_funcarg__something(request):
                 return 1
         """)
-        item = testdir.makepyfile("""
+        testdir.makepyfile("""
             def pytest_funcarg__something(request):
                 return request.getfuncargvalue("something") + 1
             def test_func(something):
@@ -192,7 +467,7 @@ class TestRequestBasic:
         assert val2 == 2
         pytest._fillfuncargs(item)
         assert item.funcargs["something"] == 1
-        assert len(item.funcargs) == 2
+        assert len(get_public_names(item.funcargs)) == 2
         assert "request" in item.funcargs
         #assert item.funcargs == {'something': 1, "other": 2}
 
@@ -212,6 +487,39 @@ class TestRequestBasic:
         ss.teardown_exact(item, None)
         print(ss.stack)
         assert teardownlist == [1]
+
+    def test_request_addfinalizer_failing_setup(self, testdir):
+        testdir.makepyfile("""
+            import pytest
+            l = [1]
+            @pytest.fixture
+            def myfix(request):
+                request.addfinalizer(l.pop)
+                assert 0
+            def test_fix(myfix):
+                pass
+            def test_finalizer_ran():
+                assert not l
+        """)
+        reprec = testdir.inline_run("-s")
+        reprec.assertoutcome(failed=1, passed=1)
+
+    def test_request_addfinalizer_failing_setup_module(self, testdir):
+        testdir.makepyfile("""
+            import pytest
+            l = [1, 2]
+            @pytest.fixture(scope="module")
+            def myfix(request):
+                request.addfinalizer(l.pop)
+                request.addfinalizer(l.pop)
+                assert 0
+            def test_fix(myfix):
+                pass
+        """)
+        reprec = testdir.inline_run("-s")
+        mod = reprec.getcalls("pytest_runtest_setup")[0].item.module
+        assert not mod.l
+
 
     def test_request_addfinalizer_partial_setup_failure(self, testdir):
         p = testdir.makepyfile("""
@@ -237,6 +545,7 @@ class TestRequestBasic:
     def test_request_fixturenames(self, testdir):
         testdir.makepyfile("""
             import pytest
+            from _pytest.pytester import get_public_names
             @pytest.fixture()
             def arg1():
                 pass
@@ -247,7 +556,7 @@ class TestRequestBasic:
             def sarg(tmpdir):
                 pass
             def test_function(request, farg):
-                assert set(request.fixturenames) == \
+                assert set(get_public_names(request.fixturenames)) == \
                        set(["tmpdir", "sarg", "arg1", "request", "farg"])
         """)
         reprec = testdir.inline_run()
@@ -295,11 +604,11 @@ class TestRequestBasic:
                 assert l == ["module", "function", "class",
                              "function", "method", "function"]
         """)
-        reprec = testdir.inline_run()
+        reprec = testdir.inline_run("-v")
         reprec.assertoutcome(passed=3)
 
     def test_fixtures_sub_subdir_normalize_sep(self, testdir):
-        # this tests that normlization of nodeids takes place
+        # this tests that normalization of nodeids takes place
         b = testdir.mkdir("tests").mkdir("unit")
         b.join("conftest.py").write(py.code.Source("""
             def pytest_funcarg__arg1():
@@ -417,12 +726,12 @@ class TestRequestCachedSetup:
 
     def test_request_cachedsetup_class(self, testdir):
         reprec = testdir.inline_runsource("""
-            mysetup = ["hello", "hello2"].pop
+            mysetup = ["hello", "hello2", "hello3"].pop
 
             def pytest_funcarg__something(request):
                 return request.cached_setup(mysetup, scope="class")
             def test_func1(something):
-                assert something == "hello2"
+                assert something == "hello3"
             def test_func2(something):
                 assert something == "hello2"
             class TestClass:
@@ -456,13 +765,13 @@ class TestRequestCachedSetup:
             l.append("setup")
         def teardown(val):
             l.append("teardown")
-        ret1 = req1.cached_setup(setup, teardown, scope="function")
+        req1.cached_setup(setup, teardown, scope="function")
         assert l == ['setup']
         # artificial call of finalizer
         setupstate = req1._pyfuncitem.session._setupstate
         setupstate._callfinalizers(item1)
         assert l == ["setup", "teardown"]
-        ret2 = req1.cached_setup(setup, teardown, scope="function")
+        req1.cached_setup(setup, teardown, scope="function")
         assert l == ["setup", "teardown", "setup"]
         setupstate._callfinalizers(item1)
         assert l == ["setup", "teardown", "setup", "teardown"]
@@ -736,6 +1045,34 @@ class TestFixtureUsages:
         reprec = testdir.inline_run()
         reprec.assertoutcome(passed=1)
 
+    def test_fixture_parametrized_with_iterator(self, testdir):
+        testdir.makepyfile("""
+            import pytest
+
+            l = []
+            def f():
+                yield 1
+                yield 2
+            dec = pytest.fixture(scope="module", params=f())
+
+            @dec
+            def arg(request):
+                return request.param
+            @dec
+            def arg2(request):
+                return request.param
+
+            def test_1(arg):
+                l.append(arg)
+            def test_2(arg2):
+                l.append(arg2*10)
+        """)
+        reprec = testdir.inline_run("-v")
+        reprec.assertoutcome(passed=4)
+        l = reprec.getcalls("pytest_runtest_call")[0].item.module.l
+        assert l == [1,2, 10,20]
+
+
 class TestFixtureManagerParseFactories:
     def pytest_funcarg__testdir(self, request):
         testdir = request.getfuncargvalue("testdir")
@@ -795,6 +1132,40 @@ class TestFixtureManagerParseFactories:
         reprec = testdir.inline_run("-s")
         reprec.assertoutcome(passed=1)
 
+    def test_parsefactories_relative_node_ids(self, testdir):
+        # example mostly taken from:
+        # https://mail.python.org/pipermail/pytest-dev/2014-September/002617.html
+        runner = testdir.mkdir("runner")
+        package = testdir.mkdir("package")
+        package.join("conftest.py").write(dedent("""\
+            import pytest
+            @pytest.fixture
+            def one():
+                return 1
+        """))
+        package.join("test_x.py").write(dedent("""\
+            def test_x(one):
+                assert one == 1
+        """))
+        sub = package.mkdir("sub")
+        sub.join("__init__.py").ensure()
+        sub.join("conftest.py").write(dedent("""\
+            import pytest
+            @pytest.fixture
+            def one():
+                return 2
+        """))
+        sub.join("test_y.py").write(dedent("""\
+            def test_x(one):
+                assert one == 2
+        """))
+        reprec = testdir.inline_run()
+        reprec.assertoutcome(passed=2)
+        with runner.as_cwd():
+            reprec = testdir.inline_run("..")
+            reprec.assertoutcome(passed=2)
+
+
 class TestAutouseDiscovery:
     def pytest_funcarg__testdir(self, testdir):
         testdir.makeconftest("""
@@ -820,9 +1191,10 @@ class TestAutouseDiscovery:
 
     def test_parsefactories_conftest(self, testdir):
         testdir.makepyfile("""
+            from _pytest.pytester import get_public_names
             def test_check_setup(item, fm):
                 autousenames = fm._getautousenames(item.nodeid)
-                assert len(autousenames) == 2
+                assert len(get_public_names(autousenames)) == 2
                 assert "perfunction2" in autousenames
                 assert "perfunction" in autousenames
         """)
@@ -994,7 +1366,7 @@ class TestAutouseManagement:
             def arg():
                 l.append(1)
                 return 0
-            @pytest.fixture(scope="class", autouse=True)
+            @pytest.fixture(scope="module", autouse=True)
             def something(arg):
                 l.append(2)
 
@@ -1136,6 +1508,7 @@ class TestAutouseManagement:
                     l.append("step2-%d" % item)
 
             def test_finish():
+                print (l)
                 assert l == ["setup-1", "step1-1", "step2-1", "teardown-1",
                              "setup-2", "step1-2", "step2-2", "teardown-2",]
         """)
@@ -1183,6 +1556,7 @@ class TestAutouseManagement:
         reprec = testdir.inline_run("-s")
         reprec.assertoutcome(passed=2)
 
+
 class TestFixtureMarker:
     def test_parametrize(self, testdir):
         testdir.makepyfile("""
@@ -1220,6 +1594,78 @@ class TestFixtureMarker:
         """)
         reprec = testdir.inline_run()
         reprec.assertoutcome(passed=3)
+
+    def test_scope_session_exc(self, testdir):
+        testdir.makepyfile("""
+            import pytest
+            l = []
+            @pytest.fixture(scope="session")
+            def fix():
+                l.append(1)
+                pytest.skip('skipping')
+
+            def test_1(fix):
+                pass
+            def test_2(fix):
+                pass
+            def test_last():
+                assert l == [1]
+        """)
+        reprec = testdir.inline_run()
+        reprec.assertoutcome(skipped=2, passed=1)
+
+    def test_scope_session_exc_two_fix(self, testdir):
+        testdir.makepyfile("""
+            import pytest
+            l = []
+            m = []
+            @pytest.fixture(scope="session")
+            def a():
+                l.append(1)
+                pytest.skip('skipping')
+            @pytest.fixture(scope="session")
+            def b(a):
+                m.append(1)
+
+            def test_1(b):
+                pass
+            def test_2(b):
+                pass
+            def test_last():
+                assert l == [1]
+                assert m == []
+        """)
+        reprec = testdir.inline_run()
+        reprec.assertoutcome(skipped=2, passed=1)
+
+    def test_scope_exc(self, testdir):
+        testdir.makepyfile(
+            test_foo="""
+                def test_foo(fix):
+                    pass
+            """,
+            test_bar="""
+                def test_bar(fix):
+                    pass
+            """,
+            conftest="""
+                import pytest
+                reqs = []
+                @pytest.fixture(scope="session")
+                def fix(request):
+                    reqs.append(1)
+                    pytest.skip()
+                @pytest.fixture
+                def req_list():
+                    return reqs
+            """,
+            test_real="""
+                def test_last(req_list):
+                    assert req_list == [1]
+            """
+        )
+        reprec = testdir.inline_run()
+        reprec.assertoutcome(skipped=2, passed=1)
 
     def test_scope_module_uses_session(self, testdir):
         testdir.makepyfile("""
@@ -1282,7 +1728,7 @@ class TestFixtureMarker:
         'request.getfuncargvalue("arg")',
         'request.cached_setup(lambda: None, scope="function")',
     ], ids=["getfuncargvalue", "cached_setup"])
-    def test_scope_mismatch(self, testdir, method):
+    def test_scope_mismatch_various(self, testdir, method):
         testdir.makeconftest("""
             import pytest
             finalized = []
@@ -1411,26 +1857,26 @@ class TestFixtureMarker:
         """)
         result = testdir.runpytest("-v")
         result.stdout.fnmatch_lines("""
-            test_mod1.py:1: test_func[s1] PASSED
-            test_mod2.py:1: test_func2[s1] PASSED
-            test_mod2.py:3: test_func3[s1-m1] PASSED
-            test_mod2.py:5: test_func3b[s1-m1] PASSED
-            test_mod2.py:3: test_func3[s1-m2] PASSED
-            test_mod2.py:5: test_func3b[s1-m2] PASSED
-            test_mod1.py:1: test_func[s2] PASSED
-            test_mod2.py:1: test_func2[s2] PASSED
-            test_mod2.py:3: test_func3[s2-m1] PASSED
-            test_mod2.py:5: test_func3b[s2-m1] PASSED
-            test_mod2.py:7: test_func4[m1] PASSED
-            test_mod2.py:3: test_func3[s2-m2] PASSED
-            test_mod2.py:5: test_func3b[s2-m2] PASSED
-            test_mod2.py:7: test_func4[m2] PASSED
-            test_mod1.py:3: test_func1[m1] PASSED
-            test_mod1.py:3: test_func1[m2] PASSED
+            test_mod1.py::test_func[s1] PASSED
+            test_mod2.py::test_func2[s1] PASSED
+            test_mod2.py::test_func3[s1-m1] PASSED
+            test_mod2.py::test_func3b[s1-m1] PASSED
+            test_mod2.py::test_func3[s1-m2] PASSED
+            test_mod2.py::test_func3b[s1-m2] PASSED
+            test_mod1.py::test_func[s2] PASSED
+            test_mod2.py::test_func2[s2] PASSED
+            test_mod2.py::test_func3[s2-m1] PASSED
+            test_mod2.py::test_func3b[s2-m1] PASSED
+            test_mod2.py::test_func4[m1] PASSED
+            test_mod2.py::test_func3[s2-m2] PASSED
+            test_mod2.py::test_func3b[s2-m2] PASSED
+            test_mod2.py::test_func4[m2] PASSED
+            test_mod1.py::test_func1[m1] PASSED
+            test_mod1.py::test_func1[m2] PASSED
         """)
 
     def test_class_ordering(self, testdir):
-        p = testdir.makeconftest("""
+        testdir.makeconftest("""
             import pytest
 
             l = []
@@ -1463,18 +1909,18 @@ class TestFixtureMarker:
         """)
         result = testdir.runpytest("-vs")
         result.stdout.fnmatch_lines("""
-            test_class_ordering.py:4: TestClass2.test_1[1-a] PASSED
-            test_class_ordering.py:4: TestClass2.test_1[2-a] PASSED
-            test_class_ordering.py:6: TestClass2.test_2[1-a] PASSED
-            test_class_ordering.py:6: TestClass2.test_2[2-a] PASSED
-            test_class_ordering.py:4: TestClass2.test_1[1-b] PASSED
-            test_class_ordering.py:4: TestClass2.test_1[2-b] PASSED
-            test_class_ordering.py:6: TestClass2.test_2[1-b] PASSED
-            test_class_ordering.py:6: TestClass2.test_2[2-b] PASSED
-            test_class_ordering.py:9: TestClass.test_3[1-a] PASSED
-            test_class_ordering.py:9: TestClass.test_3[2-a] PASSED
-            test_class_ordering.py:9: TestClass.test_3[1-b] PASSED
-            test_class_ordering.py:9: TestClass.test_3[2-b] PASSED
+            test_class_ordering.py::TestClass2::test_1[1-a] PASSED
+            test_class_ordering.py::TestClass2::test_1[2-a] PASSED
+            test_class_ordering.py::TestClass2::test_2[1-a] PASSED
+            test_class_ordering.py::TestClass2::test_2[2-a] PASSED
+            test_class_ordering.py::TestClass2::test_1[1-b] PASSED
+            test_class_ordering.py::TestClass2::test_1[2-b] PASSED
+            test_class_ordering.py::TestClass2::test_2[1-b] PASSED
+            test_class_ordering.py::TestClass2::test_2[2-b] PASSED
+            test_class_ordering.py::TestClass::test_3[1-a] PASSED
+            test_class_ordering.py::TestClass::test_3[2-a] PASSED
+            test_class_ordering.py::TestClass::test_3[1-b] PASSED
+            test_class_ordering.py::TestClass::test_3[2-b] PASSED
         """)
 
     def test_parametrize_separated_order_higher_scope_first(self, testdir):
@@ -1504,23 +1950,22 @@ class TestFixtureMarker:
                 l.append("test3")
             def test_4(modarg, arg):
                 l.append("test4")
-            def test_5():
-                assert len(l) == 12 * 3
-                expected = [
-                    'create:1', 'test1', 'fin:1', 'create:2', 'test1',
-                    'fin:2', 'create:mod1', 'test2', 'create:1', 'test3',
-                    'fin:1', 'create:2', 'test3', 'fin:2', 'create:1',
-                    'test4', 'fin:1', 'create:2', 'test4', 'fin:2',
-                    'fin:mod1', 'create:mod2', 'test2', 'create:1', 'test3',
-                    'fin:1', 'create:2', 'test3', 'fin:2', 'create:1',
-                    'test4', 'fin:1', 'create:2', 'test4', 'fin:2',
-                'fin:mod2']
-                import pprint
-                pprint.pprint(list(zip(l, expected)))
-                assert l == expected
         """)
         reprec = testdir.inline_run("-v")
-        reprec.assertoutcome(passed=12+1)
+        reprec.assertoutcome(passed=12)
+        l = reprec.getcalls("pytest_runtest_call")[0].item.module.l
+        expected = [
+            'create:1', 'test1', 'fin:1', 'create:2', 'test1',
+            'fin:2', 'create:mod1', 'test2', 'create:1', 'test3',
+            'fin:1', 'create:2', 'test3', 'fin:2', 'create:1',
+            'test4', 'fin:1', 'create:2', 'test4', 'fin:2',
+            'fin:mod1', 'create:mod2', 'test2', 'create:1', 'test3',
+            'fin:1', 'create:2', 'test3', 'fin:2', 'create:1',
+            'test4', 'fin:1', 'create:2', 'test4', 'fin:2',
+        'fin:mod2']
+        import pprint
+        pprint.pprint(list(zip(l, expected)))
+        assert l == expected
 
     def test_parametrized_fixture_teardown_order(self, testdir):
         testdir.makepyfile("""
@@ -1559,34 +2004,99 @@ class TestFixtureMarker:
         """)
         assert "error" not in result.stdout.str()
 
+    def test_fixture_finalizer(self, testdir):
+        testdir.makeconftest("""
+            import pytest
+            import sys
+
+            @pytest.fixture
+            def browser(request):
+
+                def finalize():
+                    sys.stdout.write('Finalized')
+                request.addfinalizer(finalize)
+                return {}
+        """)
+        b = testdir.mkdir("subdir")
+        b.join("test_overriden_fixture_finalizer.py").write(dedent("""
+            import pytest
+            @pytest.fixture
+            def browser(browser):
+                browser['visited'] = True
+                return browser
+
+            def test_browser(browser):
+                assert browser['visited'] is True
+        """))
+        reprec = testdir.runpytest("-s")
+        for test in ['test_browser']:
+            reprec.stdout.fnmatch_lines('*Finalized*')
+
+    def test_class_scope_with_normal_tests(self, testdir):
+        testpath = testdir.makepyfile("""
+            import pytest
+
+            class Box:
+                value = 0
+
+            @pytest.fixture(scope='class')
+            def a(request):
+                Box.value += 1
+                return Box.value
+
+            def test_a(a):
+                assert a == 1
+
+            class Test1:
+                def test_b(self, a):
+                    assert a == 2
+
+            class Test2:
+                def test_c(self, a):
+                    assert a == 3""")
+        reprec = testdir.inline_run(testpath)
+        for test in ['test_a', 'test_b', 'test_c']:
+            assert reprec.matchreport(test).passed
+
+    def test_request_is_clean(self, testdir):
+        testdir.makepyfile("""
+            import pytest
+            l = []
+            @pytest.fixture(params=[1, 2])
+            def fix(request):
+                request.addfinalizer(lambda: l.append(request.param))
+            def test_fix(fix):
+                pass
+        """)
+        reprec = testdir.inline_run("-s")
+        l = reprec.getcalls("pytest_runtest_call")[0].item.module.l
+        assert l == [1,2]
+
     def test_parametrize_separated_lifecycle(self, testdir):
         testdir.makepyfile("""
             import pytest
 
+            l = []
             @pytest.fixture(scope="module", params=[1, 2])
             def arg(request):
-                request.config.l = l # to access from outer
                 x = request.param
                 request.addfinalizer(lambda: l.append("fin%s" % x))
                 return request.param
-
-            l = []
             def test_1(arg):
                 l.append(arg)
             def test_2(arg):
                 l.append(arg)
         """)
-        reprec = testdir.inline_run("-v")
+        reprec = testdir.inline_run("-vs")
         reprec.assertoutcome(passed=4)
-        l = reprec.getcalls("pytest_configure")[0].config.l
+        l = reprec.getcalls("pytest_runtest_call")[0].item.module.l
         import pprint
         pprint.pprint(l)
-        assert len(l) == 6
+        #assert len(l) == 6
         assert l[0] == l[1] == 1
         assert l[2] == "fin1"
         assert l[3] == l[4] == 2
         assert l[5] == "fin2"
-
 
     def test_parametrize_function_scoped_finalizers_called(self, testdir):
         testdir.makepyfile("""
@@ -1609,6 +2119,69 @@ class TestFixtureMarker:
         """)
         reprec = testdir.inline_run("-v")
         reprec.assertoutcome(passed=5)
+
+
+    @pytest.mark.issue246
+    @pytest.mark.parametrize("scope", ["session", "function", "module"])
+    def test_finalizer_order_on_parametrization(self, scope, testdir):
+        testdir.makepyfile("""
+            import pytest
+            l = []
+
+            @pytest.fixture(scope=%(scope)r, params=["1"])
+            def fix1(request):
+                return request.param
+
+            @pytest.fixture(scope=%(scope)r)
+            def fix2(request, base):
+                def cleanup_fix2():
+                    assert not l, "base should not have been finalized"
+                request.addfinalizer(cleanup_fix2)
+
+            @pytest.fixture(scope=%(scope)r)
+            def base(request, fix1):
+                def cleanup_base():
+                    l.append("fin_base")
+                    print ("finalizing base")
+                request.addfinalizer(cleanup_base)
+
+            def test_begin():
+                pass
+            def test_baz(base, fix2):
+                pass
+            def test_other():
+                pass
+        """ % {"scope": scope})
+        reprec = testdir.inline_run("-lvs")
+        reprec.assertoutcome(passed=3)
+
+    @pytest.mark.issue396
+    def test_class_scope_parametrization_ordering(self, testdir):
+        testdir.makepyfile("""
+            import pytest
+            l = []
+            @pytest.fixture(params=["John", "Doe"], scope="class")
+            def human(request):
+                request.addfinalizer(lambda: l.append("fin %s" % request.param))
+                return request.param
+
+            class TestGreetings:
+                def test_hello(self, human):
+                    l.append("test_hello")
+
+            class TestMetrics:
+                def test_name(self, human):
+                    l.append("test_name")
+
+                def test_population(self, human):
+                    l.append("test_population")
+        """)
+        reprec = testdir.inline_run()
+        reprec.assertoutcome(passed=6)
+        l = reprec.getcalls("pytest_runtest_call")[0].item.module.l
+        assert l == ["test_hello", "fin John", "test_hello", "fin Doe",
+                     "test_name", "test_population", "fin John",
+                     "test_name", "test_population", "fin Doe"]
 
     def test_parametrize_setup_function(self, testdir):
         testdir.makepyfile("""
@@ -1653,6 +2226,40 @@ class TestFixtureMarker:
         """)
         reprec = testdir.inline_run()
         reprec.assertoutcome(passed=1)
+
+    def test_params_and_ids(self, testdir):
+        testdir.makepyfile("""
+            import pytest
+
+            @pytest.fixture(params=[object(), object()],
+                            ids=['alpha', 'beta'])
+            def fix(request):
+                return request.param
+
+            def test_foo(fix):
+                assert 1
+        """)
+        res = testdir.runpytest('-v')
+        res.stdout.fnmatch_lines([
+            '*test_foo*alpha*',
+            '*test_foo*beta*'])
+
+    def test_params_and_ids_yieldfixture(self, testdir):
+        testdir.makepyfile("""
+            import pytest
+
+            @pytest.yield_fixture(params=[object(), object()],
+                                  ids=['alpha', 'beta'])
+            def fix(request):
+                 yield request.param
+
+            def test_foo(fix):
+                assert 1
+        """)
+        res = testdir.runpytest('-v')
+        res.stdout.fnmatch_lines([
+            '*test_foo*alpha*',
+            '*test_foo*beta*'])
 
 
 class TestRequestScopeAccess:
@@ -1716,6 +2323,35 @@ class TestErrors:
             "*fixture*qwe123*not found*",
             "*1 error*",
         ])
+
+    def test_issue498_fixture_finalizer_failing(self, testdir):
+        testdir.makepyfile("""
+            import pytest
+            @pytest.fixture
+            def fix1(request):
+                def f():
+                    raise KeyError
+                request.addfinalizer(f)
+                return object()
+
+            l = []
+            def test_1(fix1):
+                l.append(fix1)
+            def test_2(fix1):
+                l.append(fix1)
+            def test_3():
+                assert l[0] != l[1]
+        """)
+        result = testdir.runpytest()
+        result.stdout.fnmatch_lines("""
+            *ERROR*teardown*test_1*
+            *KeyError*
+            *ERROR*teardown*test_2*
+            *KeyError*
+            *3 pass*2 error*
+        """)
+
+
 
     def test_setupfunc_missing_funcarg(self, testdir):
         testdir.makepyfile("""
@@ -1793,5 +2429,162 @@ class TestShowFixtures:
             *fixtures defined from*conftest*
             *arg1*
             *hello world*
+        """)
+
+    def test_show_fixtures_trimmed_doc(self, testdir):
+        p = testdir.makepyfile('''
+            import pytest
+            @pytest.fixture
+            def arg1():
+                """
+                line1
+                line2
+
+                """
+            @pytest.fixture
+            def arg2():
+                """
+                line1
+                line2
+
+                """
+        ''')
+        result = testdir.runpytest("--fixtures", p)
+        result.stdout.fnmatch_lines("""
+            * fixtures defined from test_show_fixtures_trimmed_doc *
+            arg2
+                line1
+                line2
+            arg1
+                line1
+                line2
+
+        """)
+
+
+class TestContextManagerFixtureFuncs:
+    def test_simple(self, testdir):
+        testdir.makepyfile("""
+            import pytest
+            @pytest.yield_fixture
+            def arg1():
+                print ("setup")
+                yield 1
+                print ("teardown")
+            def test_1(arg1):
+                print ("test1 %s" % arg1)
+            def test_2(arg1):
+                print ("test2 %s" % arg1)
+                assert 0
+        """)
+        result = testdir.runpytest("-s")
+        result.stdout.fnmatch_lines("""
+            *setup*
+            *test1 1*
+            *teardown*
+            *setup*
+            *test2 1*
+            *teardown*
+        """)
+
+    def test_scoped(self, testdir):
+        testdir.makepyfile("""
+            import pytest
+            @pytest.yield_fixture(scope="module")
+            def arg1():
+                print ("setup")
+                yield 1
+                print ("teardown")
+            def test_1(arg1):
+                print ("test1 %s" % arg1)
+            def test_2(arg1):
+                print ("test2 %s" % arg1)
+        """)
+        result = testdir.runpytest("-s")
+        result.stdout.fnmatch_lines("""
+            *setup*
+            *test1 1*
+            *test2 1*
+            *teardown*
+        """)
+
+    def test_setup_exception(self, testdir):
+        testdir.makepyfile("""
+            import pytest
+            @pytest.yield_fixture(scope="module")
+            def arg1():
+                pytest.fail("setup")
+                yield 1
+            def test_1(arg1):
+                pass
+        """)
+        result = testdir.runpytest("-s")
+        result.stdout.fnmatch_lines("""
+            *pytest.fail*setup*
+            *1 error*
+        """)
+
+    def test_teardown_exception(self, testdir):
+        testdir.makepyfile("""
+            import pytest
+            @pytest.yield_fixture(scope="module")
+            def arg1():
+                yield 1
+                pytest.fail("teardown")
+            def test_1(arg1):
+                pass
+        """)
+        result = testdir.runpytest("-s")
+        result.stdout.fnmatch_lines("""
+            *pytest.fail*teardown*
+            *1 passed*1 error*
+        """)
+
+    def test_yields_more_than_one(self, testdir):
+        testdir.makepyfile("""
+            import pytest
+            @pytest.yield_fixture(scope="module")
+            def arg1():
+                yield 1
+                yield 2
+            def test_1(arg1):
+                pass
+        """)
+        result = testdir.runpytest("-s")
+        result.stdout.fnmatch_lines("""
+            *fixture function*
+            *test_yields*:2*
+        """)
+
+
+    def test_no_yield(self, testdir):
+        testdir.makepyfile("""
+            import pytest
+            @pytest.yield_fixture(scope="module")
+            def arg1():
+                return 1
+            def test_1(arg1):
+                pass
+        """)
+        result = testdir.runpytest("-s")
+        result.stdout.fnmatch_lines("""
+            *yield_fixture*requires*yield*
+            *yield_fixture*
+            *def arg1*
+        """)
+
+    def test_yield_not_allowed_in_non_yield(self, testdir):
+        testdir.makepyfile("""
+            import pytest
+            @pytest.fixture(scope="module")
+            def arg1():
+                yield 1
+            def test_1(arg1):
+                pass
+        """)
+        result = testdir.runpytest("-s")
+        result.stdout.fnmatch_lines("""
+            *fixture*cannot use*yield*
+            *def arg1*
         """)
 

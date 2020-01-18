@@ -1,13 +1,25 @@
 Metadata-Version: 1.1
 Name: pytest
-Version: 2.3.5
-Summary: py.test: simple powerful testing with Python
+Version: 2.7.0
+Summary: pytest: simple powerful testing with Python
 Home-page: http://pytest.org
 Author: Holger Krekel, Benjamin Peterson, Ronny Pfannschmidt, Floris Bruynooghe and others
 Author-email: holger at merlinux.eu
 License: MIT license
-Description: 
-        The ``py.test`` testing tool makes it easy to write small tests, yet
+Description: .. image:: https://drone.io/bitbucket.org/pytest-dev/pytest/status.png
+           :target: https://drone.io/bitbucket.org/pytest-dev/pytest/latest
+        .. image:: https://pypip.in/v/pytest/badge.png
+           :target: https://pypi.python.org/pypi/pytest
+        
+        Documentation: http://pytest.org/latest/
+        
+        Changelog: http://pytest.org/latest/changelog.html
+        
+        Issues: https://bitbucket.org/pytest-dev/pytest/issues?status=open
+        
+        CI: https://drone.io/bitbucket.org/pytest-dev/pytest
+        
+        The ``pytest`` testing tool makes it easy to write small tests, yet
         scales to support complex functional testing.  It provides
         
         - `auto-discovery
@@ -16,11 +28,12 @@ Description:
         - detailed info on failing `assert statements <http://pytest.org/latest/assert.html>`_ (no need to remember ``self.assert*`` names)
         - `modular fixtures <http://pytest.org/latest/fixture.html>`_  for
           managing small or parametrized long-lived test resources.
-        - multi-paradigm support: you can use ``py.test`` to run test suites based
+        - multi-paradigm support: you can use ``pytest`` to run test suites based
           on `unittest <http://pytest.org/latest/unittest.html>`_ (or trial),
           `nose <http://pytest.org/latest/nose.html>`_
-        - single-source compatibility to Python2.4 all the way up to Python3.3,
-          PyPy-1.9 and Jython-2.5.1.
+        - single-source compatibility from Python2.6 all the way up to
+          Python3.4, PyPy-2.3, (jython-2.5 untested)
+        
         
         - many `external plugins <http://pytest.org/latest/plugins.html#installing-external-plugins-searching>`_.
         
@@ -39,9 +52,15 @@ Description:
         
         and report bugs at:
         
-            http://bitbucket.org/hpk42/pytest/issues/
+            http://bitbucket.org/pytest-dev/pytest/issues/
         
-        Copyright Holger Krekel and others, 2004-2012
+        and checkout or fork repo at:
+        
+            http://bitbucket.org/pytest-dev/pytest/
+        
+        
+        Copyright Holger Krekel and others, 2004-2014
+        Licensed under the MIT license.
         
 Platform: unix
 Platform: linux
@@ -58,12 +77,9 @@ Classifier: Topic :: Software Development :: Testing
 Classifier: Topic :: Software Development :: Libraries
 Classifier: Topic :: Utilities
 Classifier: Programming Language :: Python :: 2
-Classifier: Programming Language :: Python :: 3
-Classifier: Programming Language :: Python :: 2.4
-Classifier: Programming Language :: Python :: 2.5
 Classifier: Programming Language :: Python :: 2.6
 Classifier: Programming Language :: Python :: 2.7
-Classifier: Programming Language :: Python :: 3.0
-Classifier: Programming Language :: Python :: 3.1
+Classifier: Programming Language :: Python :: 3
 Classifier: Programming Language :: Python :: 3.2
 Classifier: Programming Language :: Python :: 3.3
+Classifier: Programming Language :: Python :: 3.4

@@ -1,6 +1,4 @@
-import pytest, py, sys
-from _pytest import python as funcargs
-from _pytest.python import FixtureLookupError
+import pytest, py
 
 class TestModule:
     def test_failing_import(self, testdir):
@@ -32,11 +30,11 @@ class TestModule:
 
     def test_module_considers_pluginmanager_at_import(self, testdir):
         modcol = testdir.getmodulecol("pytest_plugins='xasdlkj',")
-        pytest.raises(ImportError, "modcol.obj")
+        pytest.raises(ImportError, lambda: modcol.obj)
 
 class TestClass:
-    def test_class_with_init_skip_collect(self, testdir):
-        modcol = testdir.getmodulecol("""
+    def test_class_with_init_warning(self, testdir):
+        testdir.makepyfile("""
             class TestClass1:
                 def __init__(self):
                     pass
@@ -44,11 +42,11 @@ class TestClass:
                 def __init__(self):
                     pass
         """)
-        l = modcol.collect()
-        assert len(l) == 2
-
-        for classcol in l:
-            pytest.raises(pytest.skip.Exception, classcol.collect)
+        result = testdir.runpytest("-rw")
+        result.stdout.fnmatch_lines("""
+            WC1*test_class_with_init_warning.py*__init__*
+            *2 warnings*
+        """)
 
     def test_class_subclassobject(self, testdir):
         testdir.getmodulecol("""
@@ -278,6 +276,17 @@ class TestFunction:
         assert isinstance(modcol, pytest.Module)
         assert hasattr(modcol.obj, 'test_func')
 
+    def test_function_as_object_instance_ignored(self, testdir):
+        testdir.makepyfile("""
+            class A:
+                def __call__(self, tmpdir):
+                    0/0
+
+            test_a = A()
+        """)
+        reprec = testdir.inline_run()
+        reprec.assertoutcome()
+
     def test_function_equality(self, testdir, tmpdir):
         from _pytest.python import FixtureManager
         config = testdir.parseconfigure()
@@ -289,22 +298,10 @@ class TestFunction:
             pass
         f1 = pytest.Function(name="name", parent=session, config=config,
                 args=(1,), callobj=func1)
+        assert f1 == f1
         f2 = pytest.Function(name="name",config=config,
-                args=(1,), callobj=func2, parent=session)
-        assert not f1 == f2
+                callobj=func2, parent=session)
         assert f1 != f2
-        f3 = pytest.Function(name="name", parent=session, config=config,
-                args=(1,2), callobj=func2)
-        assert not f3 == f2
-        assert f3 != f2
-
-        assert not f3 == f1
-        assert f3 != f1
-
-        f1_b = pytest.Function(name="name", parent=session, config=config,
-              args=(1,), callobj=func1)
-        assert f1 == f1_b
-        assert not f1 != f1_b
 
     def test_issue197_parametrize_emptyset(self, testdir):
         testdir.makepyfile("""
@@ -316,6 +313,16 @@ class TestFunction:
         reprec = testdir.inline_run()
         reprec.assertoutcome(skipped=1)
 
+    def test_single_tuple_unwraps_values(self, testdir):
+        testdir.makepyfile("""
+            import pytest
+            @pytest.mark.parametrize(('arg',), [(1,)])
+            def test_function(arg):
+                assert arg == 1
+        """)
+        reprec = testdir.inline_run()
+        reprec.assertoutcome(passed=1)
+
     def test_issue213_parametrize_value_no_equal(self, testdir):
         testdir.makepyfile("""
             import pytest
@@ -326,8 +333,105 @@ class TestFunction:
             def test_function(arg):
                 assert arg.__class__.__name__ == "A"
         """)
-        reprec = testdir.inline_run()
+        reprec = testdir.inline_run("--fulltrace")
         reprec.assertoutcome(passed=1)
+
+    def test_parametrize_with_non_hashable_values(self, testdir):
+        """Test parametrization with non-hashable values."""
+        testdir.makepyfile("""
+            archival_mapping = {
+                '1.0': {'tag': '1.0'},
+                '1.2.2a1': {'tag': 'release-1.2.2a1'},
+            }
+
+            import pytest
+            @pytest.mark.parametrize('key value'.split(),
+                                     archival_mapping.items())
+            def test_archival_to_version(key, value):
+                assert key in archival_mapping
+                assert value == archival_mapping[key]
+        """)
+        rec = testdir.inline_run()
+        rec.assertoutcome(passed=2)
+
+
+    def test_parametrize_with_non_hashable_values_indirect(self, testdir):
+        """Test parametrization with non-hashable values with indirect parametrization."""
+        testdir.makepyfile("""
+            archival_mapping = {
+                '1.0': {'tag': '1.0'},
+                '1.2.2a1': {'tag': 'release-1.2.2a1'},
+            }
+
+            import pytest
+
+            @pytest.fixture
+            def key(request):
+                return request.param
+
+            @pytest.fixture
+            def value(request):
+                return request.param
+
+            @pytest.mark.parametrize('key value'.split(),
+                                     archival_mapping.items(), indirect=True)
+            def test_archival_to_version(key, value):
+                assert key in archival_mapping
+                assert value == archival_mapping[key]
+        """)
+        rec = testdir.inline_run()
+        rec.assertoutcome(passed=2)
+
+
+    def test_parametrize_overrides_fixture(self, testdir):
+        """Test parametrization when parameter overrides existing fixture with same name."""
+        testdir.makepyfile("""
+            import pytest
+
+            @pytest.fixture
+            def value():
+                return 'value'
+
+            @pytest.mark.parametrize('value',
+                                     ['overridden'])
+            def test_overridden_via_param(value):
+                assert value == 'overridden'
+        """)
+        rec = testdir.inline_run()
+        rec.assertoutcome(passed=1)
+
+
+    def test_parametrize_overrides_parametrized_fixture(self, testdir):
+        """Test parametrization when parameter overrides existing parametrized fixture with same name."""
+        testdir.makepyfile("""
+            import pytest
+
+            @pytest.fixture(params=[1, 2])
+            def value(request):
+                return request.param
+
+            @pytest.mark.parametrize('value',
+                                     ['overridden'])
+            def test_overridden_via_param(value):
+                assert value == 'overridden'
+        """)
+        rec = testdir.inline_run()
+        rec.assertoutcome(passed=1)
+
+    def test_parametrize_with_mark(selfself, testdir):
+        items = testdir.getitems("""
+            import pytest
+            @pytest.mark.foo
+            @pytest.mark.parametrize('arg', [
+                1,
+                pytest.mark.bar(pytest.mark.baz(2))
+            ])
+            def test_function(arg):
+                pass
+        """)
+        keywords = [item.keywords for item in items]
+        assert 'foo' in keywords[0] and 'bar' not in keywords[0] and 'baz' not in keywords[0]
+        assert 'foo' in keywords[1] and 'bar' in keywords[1] and 'baz' in keywords[1]
 
     def test_function_equality_with_callspec(self, testdir, tmpdir):
         items = testdir.getitems("""
@@ -414,7 +518,7 @@ class TestConftestCustomization:
         """)
         testdir.makepyfile("def test_some(): pass")
         testdir.makepyfile(test_xyz="def test_func(): pass")
-        result = testdir.runpytest("--collectonly")
+        result = testdir.runpytest("--collect-only")
         result.stdout.fnmatch_lines([
             "*<Module*test_pytest*",
             "*<MyModule*xyz*",
@@ -438,12 +542,15 @@ class TestConftestCustomization:
     def test_customized_pymakeitem(self, testdir):
         b = testdir.mkdir("a").mkdir("b")
         b.join("conftest.py").write(py.code.Source("""
-            def pytest_pycollect_makeitem(__multicall__):
-                result = __multicall__.execute()
-                if result:
-                    for func in result:
-                        func._some123 = "world"
-                return result
+            import pytest
+            @pytest.mark.hookwrapper
+            def pytest_pycollect_makeitem():
+                outcome = yield
+                if outcome.excinfo is None:
+                    result = outcome.result
+                    if result:
+                        for func in result:
+                            func._some123 = "world"
         """))
         b.join("test_module.py").write(py.code.Source("""
             import pytest
@@ -467,7 +574,7 @@ class TestConftestCustomization:
                     return MyFunction(name, collector)
         """)
         testdir.makepyfile("def some(): pass")
-        result = testdir.runpytest("--collectonly")
+        result = testdir.runpytest("--collect-only")
         result.stdout.fnmatch_lines([
             "*MyFunction*some*",
         ])
@@ -554,7 +661,7 @@ class TestTracebackCutting:
         assert "x = 1" not in out
         assert "x = 2" not in out
         result.stdout.fnmatch_lines([
-            ">*asd*",
+            " *asd*",
             "E*NameError*",
         ])
         result = testdir.runpytest("--fulltrace")
@@ -578,7 +685,7 @@ class TestReportInfo:
                     return MyFunction(name, parent=collector)
         """)
         item = testdir.getitem("def test_func(): pass")
-        runner = item.config.pluginmanager.getplugin("runner")
+        item.config.pluginmanager.getplugin("runner")
         assert item.location == ("ABCDE", 42, "custom")
 
     def test_func_reportinfo(self, testdir):
@@ -648,7 +755,7 @@ def test_customized_python_discovery(testdir):
     """)
     p2 = p.new(basename=p.basename.replace("test", "check"))
     p.move(p2)
-    result = testdir.runpytest("--collectonly", "-s")
+    result = testdir.runpytest("--collect-only", "-s")
     result.stdout.fnmatch_lines([
         "*check_customized*",
         "*check_simple*",
@@ -668,11 +775,11 @@ def test_customized_python_discovery_functions(testdir):
         [pytest]
         python_functions=_test
     """)
-    p = testdir.makepyfile("""
+    testdir.makepyfile("""
         def _test_underscore():
             pass
     """)
-    result = testdir.runpytest("--collectonly", "-s")
+    result = testdir.runpytest("--collect-only", "-s")
     result.stdout.fnmatch_lines([
         "*_test_underscore*",
     ])
@@ -721,7 +828,7 @@ def test_customize_through_attributes(testdir):
             def test_hello(self):
                 pass
     """)
-    result = testdir.runpytest("--collectonly")
+    result = testdir.runpytest("--collect-only")
     result.stdout.fnmatch_lines([
         "*MyClass*",
         "*MyInstance*",

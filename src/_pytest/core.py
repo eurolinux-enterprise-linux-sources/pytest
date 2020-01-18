@@ -1,19 +1,16 @@
 """
 pytest PluginManager, basic initialization and tracing.
-(c) Holger Krekel 2004-2010
 """
-import sys, os
+import os
+import sys
 import inspect
 import py
-from _pytest import hookspec # the extension point definitions
+# don't import pytest to avoid circular imports
 
 assert py.__version__.split(".")[:2] >= ['1', '4'], ("installation problem: "
     "%s is too old, remove or upgrade 'py'" % (py.__version__))
 
-default_plugins = (
- "config mark main terminal runner python pdb unittest capture skipping "
- "tmpdir monkeypatch recwarn pastebin helpconfig nose assertion genscript "
- "junitxml resultlog doctest").split()
+py3 = sys.version_info > (3,0)
 
 class TagTracer:
     def __init__(self):
@@ -72,69 +69,176 @@ class TagTracerSub:
     def get(self, name):
         return self.__class__(self.root, self.tags + (name,))
 
+
+def add_method_wrapper(cls, wrapper_func):
+    """ Substitute the function named "wrapperfunc.__name__" at class
+    "cls" with a function that wraps the call to the original function.
+    Return an undo function which can be called to reset the class to use
+    the old method again.
+
+    wrapper_func is called with the same arguments as the method
+    it wraps and its result is used as a wrap_controller for
+    calling the original function.
+    """
+    name = wrapper_func.__name__
+    oldcall = getattr(cls, name)
+    def wrap_exec(*args, **kwargs):
+        gen = wrapper_func(*args, **kwargs)
+        return wrapped_call(gen, lambda: oldcall(*args, **kwargs))
+
+    setattr(cls, name, wrap_exec)
+    return lambda: setattr(cls, name, oldcall)
+
+def raise_wrapfail(wrap_controller, msg):
+    co = wrap_controller.gi_code
+    raise RuntimeError("wrap_controller at %r %s:%d %s" %
+                   (co.co_name, co.co_filename, co.co_firstlineno, msg))
+
+def wrapped_call(wrap_controller, func):
+    """ Wrap calling to a function with a generator which needs to yield
+    exactly once.  The yield point will trigger calling the wrapped function
+    and return its CallOutcome to the yield point.  The generator then needs
+    to finish (raise StopIteration) in order for the wrapped call to complete.
+    """
+    try:
+        next(wrap_controller)   # first yield
+    except StopIteration:
+        raise_wrapfail(wrap_controller, "did not yield")
+    call_outcome = CallOutcome(func)
+    try:
+        wrap_controller.send(call_outcome)
+        raise_wrapfail(wrap_controller, "has second yield")
+    except StopIteration:
+        pass
+    return call_outcome.get_result()
+
+
+class CallOutcome:
+    """ Outcome of a function call, either an exception or a proper result.
+    Calling the ``get_result`` method will return the result or reraise
+    the exception raised when the function was called. """
+    excinfo = None
+    def __init__(self, func):
+        try:
+            self.result = func()
+        except Exception:
+            self.excinfo = sys.exc_info()
+
+    def force_result(self, result):
+        self.result = result
+        self.excinfo = None
+
+    def get_result(self):
+        if self.excinfo is None:
+            return self.result
+        else:
+            ex = self.excinfo
+            if py3:
+                raise ex[1].with_traceback(ex[2])
+            py.builtin._reraise(*ex)
+
+
 class PluginManager(object):
-    def __init__(self, load=False):
+    def __init__(self, hookspecs=None, prefix="pytest_"):
         self._name2plugin = {}
-        self._listattrcache = {}
         self._plugins = []
-        self._hints = []
+        self._conftestplugins = []
+        self._plugin2hookcallers = {}
+        self._warnings = []
         self.trace = TagTracer().get("pluginmanage")
         self._plugin_distinfo = []
-        if os.environ.get('PYTEST_DEBUG'):
-            err = sys.stderr
-            encoding = getattr(err, 'encoding', 'utf8')
-            try:
-                err = py.io.dupfile(err, encoding=encoding)
-            except Exception:
-                pass
-            self.trace.root.setwriter(err.write)
-        self.hook = HookRelay([hookspec], pm=self)
-        self.register(self)
-        if load:
-            for spec in default_plugins:
-                self.import_plugin(spec)
+        self._shutdown = []
+        self.hook = HookRelay(hookspecs or [], pm=self, prefix=prefix)
 
-    def register(self, plugin, name=None, prepend=False):
+    def set_tracing(self, writer):
+        self.trace.root.setwriter(writer)
+        # reconfigure HookCalling to perform tracing
+        assert not hasattr(self, "_wrapping")
+        self._wrapping = True
+
+        def _docall(self, methods, kwargs):
+            trace = self.hookrelay.trace
+            trace.root.indent += 1
+            trace(self.name, kwargs)
+            box = yield
+            if box.excinfo is None:
+                trace("finish", self.name, "-->", box.result)
+            trace.root.indent -= 1
+
+        undo = add_method_wrapper(HookCaller, _docall)
+        self.add_shutdown(undo)
+
+    def do_configure(self, config):
+        # backward compatibility
+        config.do_configure()
+
+    def set_register_callback(self, callback):
+        assert not hasattr(self, "_registercallback")
+        self._registercallback = callback
+
+    def register(self, plugin, name=None, prepend=False, conftest=False):
         if self._name2plugin.get(name, None) == -1:
             return
         name = name or getattr(plugin, '__name__', str(id(plugin)))
         if self.isregistered(plugin, name):
-            raise ValueError("Plugin already registered: %s=%s" %(name, plugin))
+            raise ValueError("Plugin already registered: %s=%s\n%s" %(
+                              name, plugin, self._name2plugin))
         #self.trace("registering", name, plugin)
+        reg = getattr(self, "_registercallback", None)
+        if reg is not None:
+            reg(plugin, name)  # may call addhooks
+        hookcallers = list(self.hook._scan_plugin(plugin))
+        self._plugin2hookcallers[plugin] = hookcallers
         self._name2plugin[name] = plugin
-        self.call_plugin(plugin, "pytest_addhooks", {'pluginmanager': self})
-        self.hook.pytest_plugin_registered(manager=self, plugin=plugin)
-        if not prepend:
-            self._plugins.append(plugin)
+        if conftest:
+            self._conftestplugins.append(plugin)
         else:
-            self._plugins.insert(0, plugin)
+            if not prepend:
+                self._plugins.append(plugin)
+            else:
+                self._plugins.insert(0, plugin)
+        # finally make sure that the methods of the new plugin take part
+        for hookcaller in hookcallers:
+            hookcaller.scan_methods()
         return True
 
-    def unregister(self, plugin=None, name=None):
-        if plugin is None:
-            plugin = self.getplugin(name=name)
-        self._plugins.remove(plugin)
-        self.hook.pytest_plugin_unregistered(plugin=plugin)
+    def unregister(self, plugin):
+        try:
+            self._plugins.remove(plugin)
+        except KeyError:
+            self._conftestplugins.remove(plugin)
         for name, value in list(self._name2plugin.items()):
             if value == plugin:
                 del self._name2plugin[name]
+        hookcallers = self._plugin2hookcallers.pop(plugin)
+        for hookcaller in hookcallers:
+            hookcaller.scan_methods()
+
+    def add_shutdown(self, func):
+        self._shutdown.append(func)
+
+    def ensure_shutdown(self):
+        while self._shutdown:
+            func = self._shutdown.pop()
+            func()
+        self._plugins = self._conftestplugins = []
+        self._name2plugin.clear()
 
     def isregistered(self, plugin, name=None):
         if self.getplugin(name) is not None:
             return True
-        for val in self._name2plugin.values():
-            if plugin == val:
-                return True
+        return plugin in self._plugins or plugin in self._conftestplugins
 
-    def addhooks(self, spec):
-        self.hook._addhooks(spec, prefix="pytest_")
+    def addhooks(self, spec, prefix="pytest_"):
+        self.hook._addhooks(spec, prefix=prefix)
 
     def getplugins(self):
-        return list(self._plugins)
+        return self._plugins + self._conftestplugins
 
     def skipifmissing(self, name):
         if not self.hasplugin(name):
-            py.test.skip("plugin %r is missing" % name)
+            import pytest
+            pytest.skip("plugin %r is missing" % name)
 
     def hasplugin(self, name):
         return bool(self.getplugin(name))
@@ -150,7 +254,7 @@ class PluginManager(object):
     # API for bootstrapping
     #
     def _envlist(self, varname):
-        val = py.std.os.environ.get(varname, None)
+        val = os.environ.get(varname, None)
         if val is not None:
             return val.split(',')
         return ()
@@ -185,15 +289,17 @@ class PluginManager(object):
     def consider_pluginarg(self, arg):
         if arg.startswith("no:"):
             name = arg[3:]
-            if self.getplugin(name) is not None:
-                self.unregister(None, name=name)
+            plugin = self.getplugin(name)
+            if plugin is not None:
+                self.unregister(plugin)
             self._name2plugin[name] = -1
         else:
             if self.getplugin(arg) is None:
                 self.import_plugin(arg)
 
     def consider_conftest(self, conftestmodule):
-        if self.register(conftestmodule, name=conftestmodule.__file__):
+        if self.register(conftestmodule, name=conftestmodule.__file__,
+                         conftest=True):
             self.consider_module(conftestmodule)
 
     def consider_module(self, mod):
@@ -209,7 +315,6 @@ class PluginManager(object):
         if self.getplugin(modname) is not None:
             return
         try:
-            #self.trace("importing", modname)
             mod = importplugin(modname)
         except KeyboardInterrupt:
             raise
@@ -218,115 +323,36 @@ class PluginManager(object):
                 return self.import_plugin(modname[7:])
             raise
         except:
-            e = py.std.sys.exc_info()[1]
-            if not hasattr(py.test, 'skip'):
+            e = sys.exc_info()[1]
+            import pytest
+            if not hasattr(pytest, 'skip') or not isinstance(e, pytest.skip.Exception):
                 raise
-            elif not isinstance(e, py.test.skip.Exception):
-                raise
-            self._hints.append("skipped plugin %r: %s" %((modname, e.msg)))
+            self._warnings.append("skipped plugin %r: %s" %((modname, e.msg)))
         else:
             self.register(mod, modname)
             self.consider_module(mod)
 
-    def pytest_configure(self, config):
-        config.addinivalue_line("markers",
-            "tryfirst: mark a hook implementation function such that the "
-            "plugin machinery will try to call it first/as early as possible.")
-        config.addinivalue_line("markers",
-            "trylast: mark a hook implementation function such that the "
-            "plugin machinery will try to call it last/as late as possible.")
-
-    def pytest_plugin_registered(self, plugin):
-        import pytest
-        dic = self.call_plugin(plugin, "pytest_namespace", {}) or {}
-        if dic:
-            self._setns(pytest, dic)
-        if hasattr(self, '_config'):
-            self.call_plugin(plugin, "pytest_addoption",
-                {'parser': self._config._parser})
-            self.call_plugin(plugin, "pytest_configure",
-                {'config': self._config})
-
-    def _setns(self, obj, dic):
-        import pytest
-        for name, value in dic.items():
-            if isinstance(value, dict):
-                mod = getattr(obj, name, None)
-                if mod is None:
-                    modname = "pytest.%s" % name
-                    mod = py.std.types.ModuleType(modname)
-                    sys.modules[modname] = mod
-                    mod.__all__ = []
-                    setattr(obj, name, mod)
-                obj.__all__.append(name)
-                self._setns(mod, value)
-            else:
-                setattr(obj, name, value)
-                obj.__all__.append(name)
-                #if obj != pytest:
-                #    pytest.__all__.append(name)
-                setattr(pytest, name, value)
-
-    def pytest_terminal_summary(self, terminalreporter):
-        tw = terminalreporter._tw
-        if terminalreporter.config.option.traceconfig:
-            for hint in self._hints:
-                tw.line("hint: %s" % hint)
-
-    def do_addoption(self, parser):
-        mname = "pytest_addoption"
-        methods = reversed(self.listattr(mname))
-        MultiCall(methods, {'parser': parser}).execute()
-
-    def do_configure(self, config):
-        assert not hasattr(self, '_config')
-        self._config = config
-        config.hook.pytest_configure(config=self._config)
-
-    def do_unconfigure(self, config):
-        config = self._config
-        del self._config
-        config.hook.pytest_unconfigure(config=config)
-        config.pluginmanager.unregister(self)
-
-    def notify_exception(self, excinfo, option=None):
-        if option and option.fulltrace:
-            style = "long"
-        else:
-            style = "native"
-        excrepr = excinfo.getrepr(funcargs=True,
-            showlocals=getattr(option, 'showlocals', False),
-            style=style,
-        )
-        res = self.hook.pytest_internalerror(excrepr=excrepr)
-        if not py.builtin.any(res):
-            for line in str(excrepr).split("\n"):
-                sys.stderr.write("INTERNALERROR> %s\n" %line)
-                sys.stderr.flush()
-
     def listattr(self, attrname, plugins=None):
         if plugins is None:
-            plugins = self._plugins
-        key = (attrname,) + tuple(plugins)
-        try:
-            return list(self._listattrcache[key])
-        except KeyError:
-            pass
+            plugins = self._plugins + self._conftestplugins
         l = []
         last = []
+        wrappers = []
         for plugin in plugins:
             try:
                 meth = getattr(plugin, attrname)
-                if hasattr(meth, 'tryfirst'):
-                    last.append(meth)
-                elif hasattr(meth, 'trylast'):
-                    l.insert(0, meth)
-                else:
-                    l.append(meth)
             except AttributeError:
                 continue
+            if hasattr(meth, 'hookwrapper'):
+                wrappers.append(meth)
+            elif hasattr(meth, 'tryfirst'):
+                last.append(meth)
+            elif hasattr(meth, 'trylast'):
+                l.insert(0, meth)
+            else:
+                l.append(meth)
         l.extend(last)
-        self._listattrcache[key] = list(l)
+        l.extend(wrappers)
         return l
 
     def call_plugin(self, plugin, methname, kwargs):
@@ -341,21 +367,16 @@ def importplugin(importspec):
         __import__(mod)
         return sys.modules[mod]
     except ImportError:
-        #e = py.std.sys.exc_info()[1]
-        #if str(e).find(name) == -1:
-        #    raise
-        pass #
-    try:
         __import__(importspec)
-    except ImportError:
-        raise ImportError(importspec)
-    return sys.modules[importspec]
+        return sys.modules[importspec]
 
 class MultiCall:
     """ execute a call into multiple python functions/methods. """
+
     def __init__(self, methods, kwargs, firstresult=False):
         self.methods = list(methods)
         self.kwargs = kwargs
+        self.kwargs["__multicall__"] = self
         self.results = []
         self.firstresult = firstresult
 
@@ -364,10 +385,13 @@ class MultiCall:
         return "<MultiCall %s, kwargs=%r>" %(status, self.kwargs)
 
     def execute(self):
+        all_kwargs = self.kwargs
         while self.methods:
             method = self.methods.pop()
-            kwargs = self.getkwargs(method)
-            res = method(**kwargs)
+            args = [all_kwargs[argname] for argname in varnames(method)]
+            if hasattr(method, "hookwrapper"):
+                return wrapped_call(method(*args), self.execute)
+            res = method(*args)
             if res is not None:
                 self.results.append(res)
                 if self.firstresult:
@@ -375,124 +399,145 @@ class MultiCall:
         if not self.firstresult:
             return self.results
 
-    def getkwargs(self, method):
-        kwargs = {}
-        for argname in varnames(method):
-            try:
-                kwargs[argname] = self.kwargs[argname]
-            except KeyError:
-                if argname == "__multicall__":
-                    kwargs[argname] = self
-        return kwargs
 
-def varnames(func):
+def varnames(func, startindex=None):
+    """ return argument name tuple for a function, method, class or callable.
+
+    In case of a class, its "__init__" method is considered.
+    For methods the "self" parameter is not included unless you are passing
+    an unbound method with Python3 (which has no supports for unbound methods)
+    """
+    cache = getattr(func, "__dict__", {})
     try:
-        return func._varnames
-    except AttributeError:
+        return cache["_varnames"]
+    except KeyError:
         pass
-    if not inspect.isfunction(func) and not inspect.ismethod(func):
-        func = getattr(func, '__call__', func)
-    ismethod = inspect.ismethod(func)
+    if inspect.isclass(func):
+        try:
+            func = func.__init__
+        except AttributeError:
+            return ()
+        startindex = 1
+    else:
+        if not inspect.isfunction(func) and not inspect.ismethod(func):
+            func = getattr(func, '__call__', func)
+        if startindex is None:
+            startindex = int(inspect.ismethod(func))
+
     rawcode = py.code.getrawcode(func)
     try:
-        x = rawcode.co_varnames[ismethod:rawcode.co_argcount]
+        x = rawcode.co_varnames[startindex:rawcode.co_argcount]
     except AttributeError:
         x = ()
-    py.builtin._getfuncdict(func)['_varnames'] = x
+    else:
+        defaults = func.__defaults__
+        if defaults:
+            x = x[:-len(defaults)]
+    try:
+        cache["_varnames"] = x
+    except TypeError:
+        pass
     return x
+
 
 class HookRelay:
     def __init__(self, hookspecs, pm, prefix="pytest_"):
         if not isinstance(hookspecs, list):
             hookspecs = [hookspecs]
-        self._hookspecs = []
         self._pm = pm
         self.trace = pm.trace.root.get("hook")
+        self.prefix = prefix
         for hookspec in hookspecs:
             self._addhooks(hookspec, prefix)
 
-    def _addhooks(self, hookspecs, prefix):
-        self._hookspecs.append(hookspecs)
+    def _addhooks(self, hookspec, prefix):
         added = False
-        for name, method in vars(hookspecs).items():
+        isclass = int(inspect.isclass(hookspec))
+        for name, method in vars(hookspec).items():
             if name.startswith(prefix):
                 firstresult = getattr(method, 'firstresult', False)
-                hc = HookCaller(self, name, firstresult=firstresult)
+                hc = HookCaller(self, name, firstresult=firstresult,
+                                argnames=varnames(method, startindex=isclass))
                 setattr(self, name, hc)
                 added = True
                 #print ("setting new hook", name)
         if not added:
             raise ValueError("did not find new %r hooks in %r" %(
-                prefix, hookspecs,))
+                prefix, hookspec,))
+
+    def _getcaller(self, name, plugins):
+        caller = getattr(self, name)
+        methods = self._pm.listattr(name, plugins=plugins)
+        if methods:
+            return caller.new_cached_caller(methods)
+        return caller
+
+    def _scan_plugin(self, plugin):
+        def fail(msg, *args):
+            name = getattr(plugin, '__name__', plugin)
+            raise PluginValidationError("plugin %r\n%s" %(name, msg % args))
+
+        for name in dir(plugin):
+            if not name.startswith(self.prefix):
+                continue
+            hook = getattr(self, name, None)
+            method = getattr(plugin, name)
+            if hook is None:
+                is_optional = getattr(method, 'optionalhook', False)
+                if not isgenerichook(name) and not is_optional:
+                    fail("found unknown hook: %r", name)
+                continue
+            for arg in varnames(method):
+                if arg not in hook.argnames:
+                    fail("argument %r not available\n"
+                         "actual definition: %s\n"
+                         "available hookargs: %s",
+                         arg, formatdef(method),
+                           ", ".join(hook.argnames))
+            yield hook
 
 
 class HookCaller:
-    def __init__(self, hookrelay, name, firstresult):
+    def __init__(self, hookrelay, name, firstresult, argnames, methods=()):
         self.hookrelay = hookrelay
         self.name = name
         self.firstresult = firstresult
-        self.trace = self.hookrelay.trace
+        self.argnames = ["__multicall__"]
+        self.argnames.extend(argnames)
+        assert "self" not in argnames  # sanity check
+        self.methods = methods
+
+    def new_cached_caller(self, methods):
+        return HookCaller(self.hookrelay, self.name, self.firstresult,
+                          argnames=self.argnames, methods=methods)
 
     def __repr__(self):
         return "<HookCaller %r>" %(self.name,)
 
-    def __call__(self, **kwargs):
-        methods = self.hookrelay._pm.listattr(self.name)
-        return self._docall(methods, kwargs)
+    def scan_methods(self):
+        self.methods = self.hookrelay._pm.listattr(self.name)
 
-    def pcall(self, plugins, **kwargs):
-        methods = self.hookrelay._pm.listattr(self.name, plugins=plugins)
-        return self._docall(methods, kwargs)
+    def __call__(self, **kwargs):
+        return self._docall(self.methods, kwargs)
+
+    def callextra(self, methods, **kwargs):
+        return self._docall(self.methods + methods, kwargs)
 
     def _docall(self, methods, kwargs):
-        self.trace(self.name, kwargs)
-        self.trace.root.indent += 1
-        mc = MultiCall(methods, kwargs, firstresult=self.firstresult)
-        try:
-            res = mc.execute()
-            if res:
-                self.trace("finish", self.name, "-->", res)
-        finally:
-            self.trace.root.indent -= 1
-        return res
+        return MultiCall(methods, kwargs,
+                         firstresult=self.firstresult).execute()
 
-_preinit = []
 
-def _preloadplugins():
-    _preinit.append(PluginManager(load=True))
+class PluginValidationError(Exception):
+    """ plugin failed validation. """
 
-def _prepareconfig(args=None, plugins=None):
-    if args is None:
-        args = sys.argv[1:]
-    elif isinstance(args, py.path.local):
-        args = [str(args)]
-    elif not isinstance(args, (tuple, list)):
-        if not isinstance(args, str):
-            raise ValueError("not a string or argument list: %r" % (args,))
-        args = py.std.shlex.split(args)
-    if _preinit:
-       _pluginmanager = _preinit.pop(0)
-    else: # subsequent calls to main will create a fresh instance
-        _pluginmanager = PluginManager(load=True)
-    hook = _pluginmanager.hook
-    if plugins:
-        for plugin in plugins:
-            _pluginmanager.register(plugin)
-    return hook.pytest_cmdline_parse(
-            pluginmanager=_pluginmanager, args=args)
+def isgenerichook(name):
+    return name == "pytest_plugins" or \
+           name.startswith("pytest_funcarg__")
 
-def main(args=None, plugins=None):
-    """ return exit code, after performing an in-process test run.
-
-    :arg args: list of command line arguments.
-
-    :arg plugins: list of plugin objects to be auto-registered during
-                  initialization.
-    """
-    config = _prepareconfig(args, plugins)
-    exitstatus = config.hook.pytest_cmdline_main(config=config)
-    return exitstatus
-
-class UsageError(Exception):
-    """ error in py.test usage or invocation"""
+def formatdef(func):
+    return "%s%s" % (
+        func.__name__,
+        inspect.formatargspec(*inspect.getargspec(func))
+    )
 

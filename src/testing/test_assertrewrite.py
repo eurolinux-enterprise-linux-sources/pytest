@@ -1,4 +1,5 @@
 import os
+import stat
 import sys
 import zipfile
 import py
@@ -106,13 +107,13 @@ class TestAssertionRewrite:
             assert f
         assert getmsg(f) == "assert False"
         def f():
-            assert a_global
+            assert a_global  # noqa
         assert getmsg(f, {"a_global" : False}) == "assert False"
         def f():
             assert sys == 42
         assert getmsg(f, {"sys" : sys}) == "assert sys == 42"
         def f():
-            assert cls == 42
+            assert cls == 42  # noqa
         class X(object):
             pass
         assert getmsg(f, {"cls" : X}) == "assert cls == 42"
@@ -120,7 +121,68 @@ class TestAssertionRewrite:
     def test_assert_already_has_message(self):
         def f():
             assert False, "something bad!"
-        assert getmsg(f) == "AssertionError: something bad!"
+        assert getmsg(f) == "AssertionError: something bad!\nassert False"
+
+    def test_assertion_message(self, testdir):
+        testdir.makepyfile("""
+            def test_foo():
+                assert 1 == 2, "The failure message"
+        """)
+        result = testdir.runpytest()
+        assert result.ret == 1
+        result.stdout.fnmatch_lines([
+            "*AssertionError*The failure message*",
+            "*assert 1 == 2*",
+        ])
+
+    def test_assertion_message_multiline(self, testdir):
+        testdir.makepyfile("""
+            def test_foo():
+                assert 1 == 2, "A multiline\\nfailure message"
+        """)
+        result = testdir.runpytest()
+        assert result.ret == 1
+        result.stdout.fnmatch_lines([
+            "*AssertionError*A multiline*",
+            "*failure message*",
+            "*assert 1 == 2*",
+        ])
+
+    def test_assertion_message_tuple(self, testdir):
+        testdir.makepyfile("""
+            def test_foo():
+                assert 1 == 2, (1, 2)
+        """)
+        result = testdir.runpytest()
+        assert result.ret == 1
+        result.stdout.fnmatch_lines([
+            "*AssertionError*%s*" % repr((1, 2)),
+            "*assert 1 == 2*",
+        ])
+
+    def test_assertion_message_expr(self, testdir):
+        testdir.makepyfile("""
+            def test_foo():
+                assert 1 == 2, 1 + 2
+        """)
+        result = testdir.runpytest()
+        assert result.ret == 1
+        result.stdout.fnmatch_lines([
+            "*AssertionError*3*",
+            "*assert 1 == 2*",
+        ])
+
+    def test_assertion_message_escape(self, testdir):
+        testdir.makepyfile("""
+            def test_foo():
+                assert 1 == 2, 'To be escaped: %'
+        """)
+        result = testdir.runpytest()
+        assert result.ret == 1
+        result.stdout.fnmatch_lines([
+            "*AssertionError: To be escaped: %",
+            "*assert 1 == 2",
+        ])
 
     def test_boolop(self):
         def f():
@@ -173,7 +235,7 @@ class TestAssertionRewrite:
 
     def test_short_circut_evaluation(self):
         def f():
-            assert True or explode
+            assert True or explode  # noqa
         getmsg(f, must_pass=True)
         def f():
             x = 1
@@ -205,9 +267,16 @@ class TestAssertionRewrite:
             assert x + y
         assert getmsg(f) == "assert (1 + -1)"
         def f():
-            x = range(10)
             assert not 5 % 4
         assert getmsg(f) == "assert not (5 % 4)"
+
+    def test_boolop_percent(self):
+        def f():
+            assert 3 % 2 and False
+        assert getmsg(f) == "assert ((3 % 2) and False)"
+        def f():
+            assert False or 4 % 2
+        assert getmsg(f) == "assert (False or (4 % 2))"
 
     def test_call(self):
         def g(a=42, *args, **kwargs):
@@ -242,12 +311,12 @@ class TestAssertionRewrite:
             g = 3
         ns = {"x" : X}
         def f():
-            assert not x.g
+            assert not x.g # noqa
         assert getmsg(f, ns) == """assert not 3
  +  where 3 = x.g"""
         def f():
-            x.a = False
-            assert x.a
+            x.a = False  # noqa
+            assert x.a   # noqa
         assert getmsg(f, ns) == """assert x.a"""
 
     def test_comparisons(self):
@@ -313,15 +382,38 @@ class TestAssertionRewrite:
             assert "%test" == "test"
         assert getmsg(f).startswith("assert '%test' == 'test'")
 
+    def test_custom_repr(self):
+        def f():
+            class Foo(object):
+                a = 1
+
+                def __repr__(self):
+                    return "\n{ \n~ \n}"
+            f = Foo()
+            assert 0 == f.a
+        assert r"where 1 = \n{ \n~ \n}.a" in util._format_lines([getmsg(f)])[0]
+
 
 class TestRewriteOnImport:
 
     def test_pycache_is_a_file(self, testdir):
         testdir.tmpdir.join("__pycache__").write("Hello")
         testdir.makepyfile("""
-def test_rewritten():
-    assert "@py_builtins" in globals()""")
+            def test_rewritten():
+                assert "@py_builtins" in globals()""")
         assert testdir.runpytest().ret == 0
+
+    def test_pycache_is_readonly(self, testdir):
+        cache = testdir.tmpdir.mkdir("__pycache__")
+        old_mode = cache.stat().mode
+        cache.chmod(old_mode ^ stat.S_IWRITE)
+        testdir.makepyfile("""
+            def test_rewritten():
+                assert "@py_builtins" in globals()""")
+        try:
+            assert testdir.runpytest().ret == 0
+        finally:
+            cache.chmod(old_mode)
 
     def test_zipfile(self, testdir):
         z = testdir.tmpdir.join("myzip.zip")
@@ -334,9 +426,9 @@ def test_rewritten():
             f.close()
         z.chmod(256)
         testdir.makepyfile("""
-import sys
-sys.path.append(%r)
-import test_gum.test_lizard""" % (z_fn,))
+            import sys
+            sys.path.append(%r)
+            import test_gum.test_lizard""" % (z_fn,))
         assert testdir.runpytest().ret == 0
 
     def test_readonly(self, testdir):
@@ -345,17 +437,21 @@ import test_gum.test_lizard""" % (z_fn,))
         py.builtin._totext("""
 def test_rewritten():
     assert "@py_builtins" in globals()
-""").encode("utf-8"), "wb")
+            """).encode("utf-8"), "wb")
+        old_mode = sub.stat().mode
         sub.chmod(320)
-        assert testdir.runpytest().ret == 0
+        try:
+            assert testdir.runpytest().ret == 0
+        finally:
+            sub.chmod(old_mode)
 
     def test_dont_write_bytecode(self, testdir, monkeypatch):
         testdir.makepyfile("""
-import os
-def test_no_bytecode():
-    assert "__pycache__" in __cached__
-    assert not os.path.exists(__cached__)
-    assert not os.path.exists(os.path.dirname(__cached__))""")
+            import os
+            def test_no_bytecode():
+                assert "__pycache__" in __cached__
+                assert not os.path.exists(__cached__)
+                assert not os.path.exists(os.path.dirname(__cached__))""")
         monkeypatch.setenv("PYTHONDONTWRITEBYTECODE", "1")
         assert testdir.runpytest().ret == 0
 
@@ -395,10 +491,177 @@ def test_rewritten():
         testdir.tmpdir.join("test_newlines.py").write(b, "wb")
         assert testdir.runpytest().ret == 0
 
+    @pytest.mark.skipif(sys.version_info < (3,3),
+            reason='packages without __init__.py not supported on python 2')
+    def test_package_without__init__py(self, testdir):
+        pkg = testdir.mkdir('a_package_without_init_py')
+        pkg.join('module.py').ensure()
+        testdir.makepyfile("import a_package_without_init_py.module")
+        assert testdir.runpytest().ret == 0
+
+class TestAssertionRewriteHookDetails(object):
+    def test_loader_is_package_false_for_module(self, testdir):
+        testdir.makepyfile(test_fun="""
+            def test_loader():
+                assert not __loader__.is_package(__name__)
+            """)
+        result = testdir.runpytest()
+        result.stdout.fnmatch_lines([
+            "* 1 passed*",
+        ])
+
+    def test_loader_is_package_true_for_package(self, testdir):
+        testdir.makepyfile(test_fun="""
+            def test_loader():
+                assert not __loader__.is_package(__name__)
+
+            def test_fun():
+                assert __loader__.is_package('fun')
+
+            def test_missing():
+                assert not __loader__.is_package('pytest_not_there')
+            """)
+        testdir.mkpydir('fun')
+        result = testdir.runpytest()
+        result.stdout.fnmatch_lines([
+            '* 3 passed*',
+        ])
+
     @pytest.mark.skipif("sys.version_info[0] >= 3")
+    @pytest.mark.xfail("hasattr(sys, 'pypy_translation_info')")
     def test_assume_ascii(self, testdir):
-        content = "u'\xe2\x99\xa5'"
+        content = "u'\xe2\x99\xa5\x01\xfe'"
         testdir.tmpdir.join("test_encoding.py").write(content, "wb")
         res = testdir.runpytest()
         assert res.ret != 0
         assert "SyntaxError: Non-ASCII character" in res.stdout.str()
+
+    @pytest.mark.skipif("sys.version_info[0] >= 3")
+    def test_detect_coding_cookie(self, testdir):
+        testdir.makepyfile(test_cookie="""
+            # -*- coding: utf-8 -*-
+            u"St\xc3\xa4d"
+            def test_rewritten():
+                assert "@py_builtins" in globals()""")
+        assert testdir.runpytest().ret == 0
+
+    @pytest.mark.skipif("sys.version_info[0] >= 3")
+    def test_detect_coding_cookie_second_line(self, testdir):
+        testdir.makepyfile(test_cookie="""
+            # -*- coding: utf-8 -*-
+            u"St\xc3\xa4d"
+            def test_rewritten():
+                assert "@py_builtins" in globals()""")
+        assert testdir.runpytest().ret == 0
+
+    @pytest.mark.skipif("sys.version_info[0] >= 3")
+    def test_detect_coding_cookie_crlf(self, testdir):
+        testdir.makepyfile(test_cookie="""
+            # -*- coding: utf-8 -*-
+            u"St\xc3\xa4d"
+            def test_rewritten():
+                assert "@py_builtins" in globals()""")
+        assert testdir.runpytest().ret == 0
+
+    def test_sys_meta_path_munged(self, testdir):
+        testdir.makepyfile("""
+            def test_meta_path():
+                import sys; sys.meta_path = []""")
+        assert testdir.runpytest().ret == 0
+
+    def test_write_pyc(self, testdir, tmpdir, monkeypatch):
+        from _pytest.assertion.rewrite import _write_pyc
+        from _pytest.assertion import AssertionState
+        try:
+            import __builtin__ as b
+        except ImportError:
+            import builtins as b
+        config = testdir.parseconfig([])
+        state = AssertionState(config, "rewrite")
+        source_path = tmpdir.ensure("source.py")
+        pycpath = tmpdir.join("pyc").strpath
+        assert _write_pyc(state, [1], source_path.stat(), pycpath)
+        def open(*args):
+            e = IOError()
+            e.errno = 10
+            raise e
+        monkeypatch.setattr(b, "open", open)
+        assert not _write_pyc(state, [1], source_path.stat(), pycpath)
+
+    def test_resources_provider_for_loader(self, testdir):
+        """
+        Attempts to load resources from a package should succeed normally,
+        even when the AssertionRewriteHook is used to load the modules.
+
+        See #366 for details.
+        """
+        pytest.importorskip("pkg_resources")
+
+        testdir.mkpydir('testpkg')
+        contents = {
+            'testpkg/test_pkg': """
+                import pkg_resources
+
+                import pytest
+                from _pytest.assertion.rewrite import AssertionRewritingHook
+
+                def test_load_resource():
+                    assert isinstance(__loader__, AssertionRewritingHook)
+                    res = pkg_resources.resource_string(__name__, 'resource.txt')
+                    res = res.decode('ascii')
+                    assert res == 'Load me please.'
+                """,
+        }
+        testdir.makepyfile(**contents)
+        testdir.maketxtfile(**{'testpkg/resource': "Load me please."})
+
+        result = testdir.runpytest()
+        result.stdout.fnmatch_lines([
+            '* 1 passed*',
+        ])
+
+    def test_read_pyc(self, tmpdir):
+        """
+        Ensure that the `_read_pyc` can properly deal with corrupted pyc files.
+        In those circumstances it should just give up instead of generating
+        an exception that is propagated to the caller.
+        """
+        import py_compile
+        from _pytest.assertion.rewrite import _read_pyc
+
+        source = tmpdir.join('source.py')
+        pyc = source + 'c'
+
+        source.write('def test(): pass')
+        py_compile.compile(str(source), str(pyc))
+
+        contents = pyc.read(mode='rb')
+        strip_bytes = 20  # header is around 8 bytes, strip a little more
+        assert len(contents) > strip_bytes
+        pyc.write(contents[:strip_bytes], mode='wb')
+
+        assert _read_pyc(source, str(pyc)) is None  # no error
+
+    def test_reload_is_same(self, testdir):
+        # A file that will be picked up during collecting.
+        testdir.tmpdir.join("file.py").ensure()
+        testdir.tmpdir.join("pytest.ini").write(py.std.textwrap.dedent("""
+            [pytest]
+            python_files = *.py
+        """))
+
+        testdir.makepyfile(test_fun="""
+            import sys
+            try:
+                from imp import reload
+            except ImportError:
+                pass
+
+            def test_loader():
+                import file
+                assert sys.modules["file"] is reload(file)
+            """)
+        result = testdir.runpytest('-s')
+        result.stdout.fnmatch_lines([
+            "* 1 passed*",
+        ])

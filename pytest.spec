@@ -5,17 +5,18 @@
 %{!?python_sitelib: %global python_sitelib %(%{__python} -c "from distutils.sysconfig import get_python_lib; print(get_python_lib())")}
 %endif
 
-%global pylib_version 1.4.12
+%global pylib_version 1.4.25
 
 Name:           pytest
-Version:        2.3.5
-Release:        4%{?dist}
+Version:        2.7.0
+Release:        1%{?dist}
 Summary:        Simple powerful testing with Python
 
 Group:          Development/Languages
 License:        MIT
 URL:            http://pytest.org
 Source0:        http://pypi.python.org/packages/source/p/%{name}/%{name}-%{version}.tar.gz
+
 BuildRoot:      %{_tmppath}/%{name}-%{version}-%{release}-root-%(%{__id_u} -n)
 
 BuildArch:      noarch
@@ -136,8 +137,9 @@ rm -rf %{buildroot}
 
 
 %check
-PYTHONPATH=%{buildroot}%{python_sitelib} \
-  %{buildroot}%{_bindir}/py.test -r s
+PATH=%{buildroot}%{_bindir}:${PATH} \
+PYTHONPATH=%{buildroot}%{python2_sitelib} \
+%{buildroot}%{_bindir}/py.test -r s testing
 %if 0%{?with_python3}
 pushd %{py3dir}
 PYTHONPATH=%{buildroot}%{python3_sitelib} \
@@ -166,6 +168,10 @@ popd
 
 
 %changelog
+* Wed May 06 2015 Matej Stuchlik <mstuchli@redhat.com> - 2.7.0-1
+- Update to 2.7.0
+Resolves: rhbz#1206254
+
 * Fri Dec 27 2013 Daniel Mach <dmach@redhat.com> - 2.3.5-4
 - Mass rebuild 2013-12-27
 
